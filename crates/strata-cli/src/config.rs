@@ -38,7 +38,7 @@ strata.gc.budget-bytes=33554432
 ";
 
 /// CLI 侧顶层配置。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StrataConfig {
     /// 是否启用 Strata 存储引擎（false = 回退 Anvil）。
     pub enabled: bool,
@@ -47,7 +47,7 @@ pub struct StrataConfig {
     pub gc: GcConfig,
 }
 
-#[derive(Default)]
+
 
 // TierConfig/StoreConfig/GcConfig 只派生 Debug+Clone，这里按公开字段逐一比较。
 impl PartialEq for StrataConfig {

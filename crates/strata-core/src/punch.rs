@@ -132,6 +132,7 @@ mod windows {
     pub(super) fn punch(file: &mut File, offset: u64, len: u64) -> Result<PunchOutcome, StrataError> {
         // punch_hole 已保证 offset + len 不溢出。
         let handle = file.as_raw_handle() as WinHandle;
+        let end = offset + len;
         let mut ret: u32 = 0;
 
         // 1) 设置稀疏属性；失败（例如卷不支持稀疏文件）→ Unsupported。
