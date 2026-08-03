@@ -10,7 +10,7 @@
 //! | section       | contents |
 //! |---------------|----------|
 //! | header (20 B) | magic "VARC" \| region_x i32 \| region_z i32 \| block_count u32 \| slot_count u32 |
-//! | block table   | `block_count × (file_offset u64 \| comp_len u32 \| plain_len u32 \| slot_count u16)` |
+//! | block table   | `block_count × (file_offset u64 \| comp_len u32 \| plain_len u32)` |
 //! | slot table    | `slot_count × (x_rel u16 \| z_rel u16 \| type_id u16 \| block u16 \| offset_in_block u32 \| plain_len u32)`, sorted by `(z_rel, x_rel, type_id)` |
 //! | block data    | one zstd frame per block; a block is the concatenation of its entries, each `[40-byte envelope | NBT]` |
 //!
@@ -152,7 +152,6 @@ impl ArchiveBuilder {
         struct BlockOut {
             comp: Vec<u8>,
             plain_len: u32,
-            slot_count: u16,
         }
         struct SlotRec {
             x_rel: u16,
@@ -201,7 +200,6 @@ impl ArchiveBuilder {
             block_outs.push(BlockOut {
                 comp,
                 plain_len,
-                slot_count: chunk.len() as u16,
             });
         }
 
@@ -227,7 +225,6 @@ impl ArchiveBuilder {
             out.extend_from_slice(&offset.to_le_bytes());
             out.extend_from_slice(&(b.comp.len() as u32).to_le_bytes());
             out.extend_from_slice(&b.plain_len.to_le_bytes());
-            out.extend_from_slice(&b.slot_count.to_le_bytes());
         }
         for s in &slots {
             out.extend_from_slice(&s.x_rel.to_le_bytes());
