@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/strata-core", "crates/strata-cli"]
+
+[workspace.dependencies]
+zstd = "0.13"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+thiserror = "2"
