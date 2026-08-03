@@ -31,7 +31,7 @@ fn archive_block_read_bound_and_invalidate() {
     // 1024 records, 64 per block.
     assert_eq!(
         s.blocks,
-        (1024 + COLD_BLOCK_CHUNKS as u32 - 1) / COLD_BLOCK_CHUNKS as u32
+        1024u32.div_ceil(COLD_BLOCK_CHUNKS as u32)
     );
     assert_eq!(s.blocks, 16);
     assert_eq!(s.plain_bytes, 1024 * (ENVELOPE_SIZE as u64 + 200));

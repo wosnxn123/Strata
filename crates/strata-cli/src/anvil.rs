@@ -171,7 +171,7 @@ pub fn write_region(path: &Path, chunks: &[ChunkLoc]) -> anyhow::Result<()> {
 
     for (chunk, record) in chunks.iter().zip(&records) {
         let index = chunk_index(chunk.x, chunk.z);
-        let sectors = (record.len() + SECTOR - 1) / SECTOR;
+        let sectors = record.len().div_ceil(SECTOR);
         locations[index] = ((sector as u32) << 8) | (sectors as u32);
         timestamps[index] = chunk.timestamp;
         body.extend_from_slice(record);
