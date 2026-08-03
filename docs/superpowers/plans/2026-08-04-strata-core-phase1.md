@@ -1,8 +1,8 @@
-# Vault Core (Phase 1) Implementation Plan — v2
+# Strata Core (Phase 1) Implementation Plan — v2
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 实现 Vault 存储引擎纯 Rust 核心（`vault-core`）与离线工具（`vault-cli`）：40B 信封、段日志引擎、三层有界索引（位图+SIEVE+磁盘索引页）、epoch 崩溃恢复、影子双副本 manifest、三档 GC（hole-punch/删除/压实打分）、分块冷归档（superfeatures 排序 + per-type 字典）、Cesium 式双向转换（覆盖、保留源、进度恢复）、`vault.properties` 配置矩阵——全部独立于 JVM，可测试、可基准，**内存与世界大小无关**。
+**Goal:** 实现 Strata 存储引擎纯 Rust 核心（`strata-core`）与离线工具（`strata-cli`）：40B 信封、段日志引擎、三层有界索引（位图+SIEVE+磁盘索引页）、epoch 崩溃恢复、影子双副本 manifest、三档 GC（hole-punch/删除/压实打分）、分块冷归档（superfeatures 排序 + per-type 字典）、Cesium 式双向转换（覆盖、保留源、进度恢复）、`strata.properties` 配置矩阵——全部独立于 JVM，可测试、可基准，**内存与世界大小无关**。
 
 **Architecture:** 每 dimension 一个存储池：追加式段文件（regionizer 分区分片）+ 三层索引（L0 位图常驻 / L1 SIEVE 有界缓存 / L2 磁盘索引页）+ epoch 日志（对齐 autosave）+ 影子双副本 manifest；稳定 region 晋升为分块固态归档 `.varc`。GC 三档：hole-punch（Linux fallocate / Windows FSCTL_SET_ZERO_DATA）→ 整段删除 → 打分压实。Rust 永不解析 NBT 负载。
 
@@ -16,11 +16,11 @@
 - 崩溃一致性 = 原版等价：最多丢一个未 fsync 的 epoch 周期；epoch 边界由 `flush()` 触发。
 - 每条记录带 `xxhash64(压缩负载)`，单条损坏只隔离该记录。
 - **启动只读 manifest + 位图，O(段数)；全扫描仅为恢复/verify 路径。**
-- **内存上界**：L1 索引页缓存与冷块缓存共享 `vault.index.cache-mb` 预算（默认 512）。
+- **内存上界**：L1 索引页缓存与冷块缓存共享 `strata.index.cache-mb` 预算（默认 512）。
 - GC hole-punch 最小洞尺寸 64KB（NTFS 稀疏粒度）。
 - 转换**绝不删除源格式文件**；重复执行同方向转换直接覆盖目标（Cesium wiki 行为）；转换结束打印保留提示。
-- 配置载体 `vault.properties`；非法值报错指明行号；组合合法性按规格 §9 矩阵（含 WARN 语义）。
-- `vault.enabled` 默认 **false**。
+- 配置载体 `strata.properties`；非法值报错指明行号；组合合法性按规格 §9 矩阵（含 WARN 语义）。
+- `strata.enabled` 默认 **false**。
 - 测试可在 Windows stable Rust 上运行；每个任务结束必须 commit；TDD。
 - 目标平台：`x86_64-pc-windows-msvc` 与 `x86_64-unknown-linux-gnu`。
 
@@ -29,8 +29,8 @@
 ## File Structure
 
 ```
-Cargo.toml                      # workspace: crates/vault-core, crates/vault-cli
-crates/vault-core/
+Cargo.toml                      # workspace: crates/strata-core, crates/strata-cli
+crates/strata-core/
   src/lib.rs                    # re-exports
   src/error.rs                  # 统一错误类型
   src/envelope.rs               # 40B 信封编解码
@@ -46,10 +46,10 @@ crates/vault-core/
   src/cold.rs                   # .varc 分块归档（superfeatures 排序）
   src/tier.rs                   # 热↔冷迁移策略
   tests/roundtrip.rs            # 端到端集成测试
-crates/vault-cli/
+crates/strata-cli/
   src/main.rs                   # clap 子命令
   src/anvil.rs                  # Anvil .mca/.mcc 读写
-  src/config.rs                 # vault.properties 加载器 + 组合矩阵
+  src/config.rs                 # strata.properties 加载器 + 组合矩阵
   tests/cli.rs
 benches/vs_anvil.rs             # criterion 基准
 ```
@@ -59,10 +59,10 @@ benches/vs_anvil.rs             # criterion 基准
 ### Task 1: Workspace 脚手架
 
 **Files:**
-- Create: `Cargo.toml`, `crates/vault-core/Cargo.toml`, `crates/vault-core/src/lib.rs`, `crates/vault-core/src/error.rs`, `crates/vault-cli/Cargo.toml`, `crates/vault-cli/src/main.rs`, `.gitignore`
+- Create: `Cargo.toml`, `crates/strata-core/Cargo.toml`, `crates/strata-core/src/lib.rs`, `crates/strata-core/src/error.rs`, `crates/strata-cli/Cargo.toml`, `crates/strata-cli/src/main.rs`, `.gitignore`
 
 **Interfaces:**
-- Produces: 可编译 workspace；`vault_core::VaultError` 枚举（`Io`, `Envelope(String)`, `Codec(String)`, `Corrupt { path, detail }`, `Manifest(String)`, `Config { file: String, line: u32, detail: String }`）
+- Produces: 可编译 workspace；`strata_core::StrataError` 枚举（`Io`, `Envelope(String)`, `Codec(String)`, `Corrupt { path, detail }`, `Manifest(String)`, `Config { file: String, line: u32, detail: String }`）
 
 - [ ] **Step 1: 安装 Rust 工具链（若缺失）**
 
@@ -75,7 +75,7 @@ Expected: `rustc 1.xx.x`（Windows 先运行 rustup-init.exe）
 ```toml
 [workspace]
 resolver = "2"
-members = ["crates/vault-core", "crates/vault-cli"]
+members = ["crates/strata-core", "crates/strata-cli"]
 
 [workspace.dependencies]
 zstd = "0.13"
@@ -83,10 +83,10 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 thiserror = "2"
 ```
 
-`crates/vault-core/Cargo.toml`:
+`crates/strata-core/Cargo.toml`:
 ```toml
 [package]
-name = "vault-core"
+name = "strata-core"
 version = "0.2.0"
 edition = "2021"
 
@@ -103,15 +103,15 @@ tempfile = "3"
 proptest = "1"
 ```
 
-`crates/vault-cli/Cargo.toml`:
+`crates/strata-cli/Cargo.toml`:
 ```toml
 [package]
-name = "vault-cli"
+name = "strata-cli"
 version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-vault-core = { path = "../vault-core" }
+strata-core = { path = "../strata-core" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 zstd = { workspace = true }
@@ -127,12 +127,12 @@ name = "vs_anvil"
 harness = false
 ```
 
-`crates/vault-core/src/error.rs`:
+`crates/strata-core/src/error.rs`:
 ```rust
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum VaultError {
+pub enum StrataError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("envelope: {0}")]
@@ -148,16 +148,16 @@ pub enum VaultError {
 }
 ```
 
-`crates/vault-core/src/lib.rs`:
+`crates/strata-core/src/lib.rs`:
 ```rust
 pub mod error;
-pub use error::VaultError;
+pub use error::StrataError;
 ```
 
-`crates/vault-cli/src/main.rs`:
+`crates/strata-cli/src/main.rs`:
 ```rust
 fn main() {
-    println!("vault-cli stub");
+    println!("strata-cli stub");
 }
 ```
 
@@ -171,7 +171,7 @@ Expected: BUILD OK，0 测试
 - [ ] **Step 4: Commit**
 
 ```bash
-git add . && git commit -m "feat: vault workspace scaffolding (v2)"
+git add . && git commit -m "feat: strata workspace scaffolding (v2)"
 ```
 
 ---
@@ -179,7 +179,7 @@ git add . && git commit -m "feat: vault workspace scaffolding (v2)"
 ### Task 2: 信封格式（40B 定长头）
 
 **Files:**
-- Create: `crates/vault-core/src/envelope.rs`
+- Create: `crates/strata-core/src/envelope.rs`
 - Test: 内嵌 `#[cfg(test)]` + `tests/envelope_proptest.rs`
 
 **Interfaces:**
@@ -229,12 +229,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core envelope`（编译错误）
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core envelope`（编译错误）
 
 - [ ] **Step 3: 实现**
 
 ```rust
-use crate::VaultError;
+use crate::StrataError;
 
 pub const ENVELOPE_SIZE: usize = 40;
 pub const MAGIC: [u8; 4] = *b"VSEG";
@@ -267,9 +267,9 @@ impl Envelope {
         out[32..40].copy_from_slice(&self.payload_hash.to_le_bytes());
     }
 
-    pub fn decode(b: &[u8; ENVELOPE_SIZE]) -> Result<Self, VaultError> {
+    pub fn decode(b: &[u8; ENVELOPE_SIZE]) -> Result<Self, StrataError> {
         if b[0..4] != MAGIC {
-            return Err(VaultError::Envelope("bad magic".into()));
+            return Err(StrataError::Envelope("bad magic".into()));
         }
         Ok(Self {
             record_ver: b[4],
@@ -288,14 +288,14 @@ impl Envelope {
 
 `lib.rs` 追加 `pub mod envelope;`。
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core envelope`，3 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core envelope`，3 PASS
 
 - [ ] **Step 5: 属性测试** `tests/envelope_proptest.rs`（任意字段往返 + 单比特翻转必检出，同 v1 计划的 proptest 模板，字段按新结构）
 
 - [ ] **Step 6: 运行并 commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): 40-byte envelope format with proptest coverage"
+git add crates/strata-core && git commit -m "feat(core): 40-byte envelope format with proptest coverage"
 ```
 
 ---
@@ -303,11 +303,11 @@ git add crates/vault-core && git commit -m "feat(core): 40-byte envelope format 
 ### Task 3: 压缩编解码注册表（comp_id 双语义）
 
 **Files:**
-- Create: `crates/vault-core/src/codec.rs`, `crates/vault-core/src/dict.rs`
+- Create: `crates/strata-core/src/codec.rs`, `crates/strata-core/src/dict.rs`
 - Test: 内嵌 `#[cfg(test)]`
 
 **Interfaces:**
-- Consumes: `VaultError::Codec`
+- Consumes: `StrataError::Codec`
 - Produces: `CODEC_NONE: u8 = 0`, `CODEC_ZSTD: u8 = 1`；`codec_id(comp_id) -> u8`（低 4 位）、`dict_slot(comp_id) -> u8`（高 4 位）、`make_comp_id(codec, slot) -> u8`；`Codec` trait 与 `codec_for(comp_id, zstd_level, dict: Option<&[u8]>) -> Result<Box<dyn Codec>>`；`dict.rs`: `train_dictionary(samples: &[&[u8]]) -> Result<Vec<u8>>`（zstd 训练，samples ≥100 条且总 ≥100KB，不足返回空字典）
 
 - [ ] **Step 1: 写失败测试**
@@ -364,18 +364,18 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core codec dict`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core codec dict`
 
 - [ ] **Step 3: 实现**
 - `codec.rs`：`NoneCodec`（透传）；`ZstdCodec { level, dict: Option<Vec<u8>> }`——有字典时用 `zstd::dict::EncoderDictionary`/`DecoderDictionary`；`codec_for` 按 codec_id 分发，字典为 None 时 slot 必须为 0。
 - `dict.rs`：`zstd::dict::from_samples`（字典大小 32KB），样本不足返回 `Ok(vec![])`。
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core`，4 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core`，4 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): codec registry with comp_id dual semantics + dictionary training"
+git add crates/strata-core && git commit -m "feat(core): codec registry with comp_id dual semantics + dictionary training"
 ```
 
 ---
@@ -383,7 +383,7 @@ git add crates/vault-core && git commit -m "feat(core): codec registry with comp
 ### Task 4: 段文件写入器
 
 **Files:**
-- Create: `crates/vault-core/src/segment.rs`（writer）
+- Create: `crates/strata-core/src/segment.rs`（writer）
 - Test: 内嵌 `#[cfg(test)]`
 
 **Interfaces:**
@@ -409,16 +409,16 @@ fn append_returns_correct_offsets() {
 ```
 （`env(len)` 辅助函数构造 Envelope，`payload_hash` 由调用方填。）
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core segment`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core segment`
 
 - [ ] **Step 3: 实现**（`BufWriter` 追加；`append` 返回头偏移；`fsync` = flush + `sync_all`）
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core segment`，PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core segment`，PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): segment file writer"
+git add crates/strata-core && git commit -m "feat(core): segment file writer"
 ```
 
 ---
@@ -426,23 +426,23 @@ git add crates/vault-core && git commit -m "feat(core): segment file writer"
 ### Task 5: 段文件扫描器（损坏隔离 + 重同步）
 
 **Files:**
-- Modify: `crates/vault-core/src/segment.rs`（scan）
+- Modify: `crates/strata-core/src/segment.rs`（scan）
 
 **Interfaces:**
-- Produces: `ScannedRecord { env, offset, payload }`；`scan_segment(path) -> Result<ScanResult { records, truncated_tail: bool }>`。契约：尾部坏/不足 → `truncated_tail=true` 停止；中部坏 → `VaultError::Corrupt`；hash 不符 → 该记录 `payload_hash=0` 保留继续；**magic 扫描重同步**：遇到坏字节时向前找下一个 `b"VSEG"`（最多 64KB），找到则继续扫描并计入 `resync_count`。
+- Produces: `ScannedRecord { env, offset, payload }`；`scan_segment(path) -> Result<ScanResult { records, truncated_tail: bool }>`。契约：尾部坏/不足 → `truncated_tail=true` 停止；中部坏 → `StrataError::Corrupt`；hash 不符 → 该记录 `payload_hash=0` 保留继续；**magic 扫描重同步**：遇到坏字节时向前找下一个 `b"VSEG"`（最多 64KB），找到则继续扫描并计入 `resync_count`。
 
 - [ ] **Step 1: 写失败测试**（roundtrip / truncated_tail_tolerated / hash_mismatch_flagged / resync_after_garbage 四例——构造：两条好记录中间插入 100B 垃圾 + 一条好记录，断言 resync_count==1 且 3 条记录全找回）
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core scan`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core scan`
 
 - [ ] **Step 3: 实现 `scan_segment`**（顺序读 40B 头→decode→读 payload→校验；decode 失败走重同步窗口搜索）
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core segment`，4 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core segment`，4 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): segment scanner with corruption isolation and magic resync"
+git add crates/strata-core && git commit -m "feat(core): segment scanner with corruption isolation and magic resync"
 ```
 
 ---
@@ -450,7 +450,7 @@ git add crates/vault-core && git commit -m "feat(core): segment scanner with cor
 ### Task 6: 三层索引（位图 + SIEVE + 磁盘索引页）
 
 **Files:**
-- Create: `crates/vault-core/src/index.rs`
+- Create: `crates/strata-core/src/index.rs`
 - Test: 内嵌 `#[cfg(test)]` + `tests/index_memory_bound.rs`
 
 **Interfaces:**
@@ -466,7 +466,7 @@ pub struct IndexPage { /* 排序 Vec<(IndexKey, IndexVal)>，序列化：条目�
 impl IndexPage {
     pub fn from_entries(entries: Vec<(IndexKey, IndexVal)>) -> Self; // 排序 + 去重（同键留最大 gen）
     pub fn serialize(&self) -> Vec<u8>;
-    pub fn deserialize(b: &[u8]) -> Result<Self, VaultError>;
+    pub fn deserialize(b: &[u8]) -> Result<Self, StrataError>;
     pub fn lookup(&self, k: &IndexKey) -> Option<&IndexVal>; // 二分
 }
 
@@ -526,7 +526,7 @@ fn sieve_evicts_unvisited_keeps_visited_bounded() {
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core index sieve bitmap`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core index sieve bitmap`
 
 - [ ] **Step 3: 实现**
 - 位图：固定 `[u8; 384]`（3 类型 × 1024 bit）。
@@ -538,7 +538,7 @@ fn sieve_evicts_unvisited_keeps_visited_bounded() {
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): three-tier index (bitmap + SIEVE cache + disk index pages)"
+git add crates/strata-core && git commit -m "feat(core): three-tier index (bitmap + SIEVE cache + disk index pages)"
 ```
 
 ---
@@ -546,11 +546,11 @@ git add crates/vault-core && git commit -m "feat(core): three-tier index (bitmap
 ### Task 7: hole-punch 跨平台抽象
 
 **Files:**
-- Create: `crates/vault-core/src/punch.rs`
+- Create: `crates/strata-core/src/punch.rs`
 - Test: 内嵌 `#[cfg(test)]`
 
 **Interfaces:**
-- Produces: `pub fn punch_hole(file: &mut File, offset: u64, len: u64) -> Result<PunchOutcome, VaultError>`；`PunchOutcome::{Done, Unsupported}`。契约：len < 64KB → 直接返回 Unsupported（调用方改走压实）；Linux `libc::fallocate(FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE)`；Windows `DeviceIoControl(FSCTL_SET_ZERO_DATA)`（需 sparse file 属性，失败则 Unsupported）；Unsupported 时文件内容不变。
+- Produces: `pub fn punch_hole(file: &mut File, offset: u64, len: u64) -> Result<PunchOutcome, StrataError>`；`PunchOutcome::{Done, Unsupported}`。契约：len < 64KB → 直接返回 Unsupported（调用方改走压实）；Linux `libc::fallocate(FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE)`；Windows `DeviceIoControl(FSCTL_SET_ZERO_DATA)`（需 sparse file 属性，失败则 Unsupported）；Unsupported 时文件内容不变。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -579,16 +579,16 @@ fn too_small_hole_rejected() {
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core punch`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core punch`
 
 - [ ] **Step 3: 实现**（`#[cfg(unix)]` / `#[cfg(windows)]` 双实现；Windows 需先 `FSCTL_SET_SPARSE`；`Cargo.toml` unix 侧加 `libc = "0.2"`）
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core punch`，2 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core punch`，2 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): cross-platform hole punch (fallocate / FSCTL_SET_ZERO_DATA)"
+git add crates/strata-core && git commit -m "feat(core): cross-platform hole punch (fallocate / FSCTL_SET_ZERO_DATA)"
 ```
 
 ---
@@ -596,7 +596,7 @@ git add crates/vault-core && git commit -m "feat(core): cross-platform hole punc
 ### Task 8: epoch 日志与回放
 
 **Files:**
-- Create: `crates/vault-core/src/epoch.rs`
+- Create: `crates/strata-core/src/epoch.rs`
 - Test: 内嵌 `#[cfg(test)]`
 
 **Interfaces:**
@@ -605,16 +605,16 @@ git add crates/vault-core && git commit -m "feat(core): cross-platform hole punc
 
 - [ ] **Step 1: 写失败测试**（record_rotate_replay_cycle + torn_tail_entry_dropped，同 v1 计划）
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core epoch`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core epoch`
 
 - [ ] **Step 3: 实现**（64B 定长条目追加；rotate = flush+sync_all+set_len(0)+sync）
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core epoch`，2 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core epoch`，2 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): epoch log with crash-tolerant replay"
+git add crates/strata-core && git commit -m "feat(core): epoch log with crash-tolerant replay"
 ```
 
 ---
@@ -622,7 +622,7 @@ git add crates/vault-core && git commit -m "feat(core): epoch log with crash-tol
 ### Task 9: Manifest 影子双副本
 
 **Files:**
-- Create: `crates/vault-core/src/manifest.rs`
+- Create: `crates/strata-core/src/manifest.rs`
 - Test: 内嵌 `#[cfg(test)]`
 
 **Interfaces:**
@@ -644,23 +644,23 @@ pub struct Manifest {
     pub dict_slots: Vec<(u16, Vec<u8>)>,           // (type_id, 字典内容)，≤16 槽
 }
 impl Manifest {
-    pub fn save(&self, dir: &Path) -> Result<(), VaultError>; // tmp+fsync → rename .bak → rename 主 → 目录 fsync
-    pub fn load(dir: &Path) -> Result<Option<Manifest>, VaultError>; // 主坏切 .bak，都坏 Err(Corrupt)，都无 Ok(None)
+    pub fn save(&self, dir: &Path) -> Result<(), StrataError>; // tmp+fsync → rename .bak → rename 主 → 目录 fsync
+    pub fn load(dir: &Path) -> Result<Option<Manifest>, StrataError>; // 主坏切 .bak，都坏 Err(Corrupt)，都无 Ok(None)
 }
 ```
 
 - [ ] **Step 1: 写失败测试**（save_load_roundtrip_and_failover + empty_dir_loads_none，同 v1）
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core manifest`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core manifest`
 
 - [ ] **Step 3: 实现**（手写小端序列化；body 前置 8B xxh64）
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core manifest`，2 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core manifest`，2 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): shadow dual-copy manifest with region bitmaps"
+git add crates/strata-core && git commit -m "feat(core): shadow dual-copy manifest with region bitmaps"
 ```
 
 ---
@@ -668,8 +668,8 @@ git add crates/vault-core && git commit -m "feat(core): shadow dual-copy manifes
 ### Task 10: Store 门面（三层索引读路径 + 启动不扫段）
 
 **Files:**
-- Create: `crates/vault-core/src/store.rs`
-- Test: `crates/vault-core/tests/roundtrip.rs`
+- Create: `crates/strata-core/src/store.rs`
+- Test: `crates/strata-core/tests/roundtrip.rs`
 
 **Interfaces:**
 - Consumes: Tasks 2–9
@@ -685,15 +685,15 @@ pub struct StoreConfig {
     pub segment_max_bytes: u64,    // 默认 64 MiB
 }
 impl Store {
-    pub fn open(root: &Path, cfg: StoreConfig) -> Result<Store, VaultError>;
+    pub fn open(root: &Path, cfg: StoreConfig) -> Result<Store, StrataError>;
     // 启动：load manifest（None→新建）→ 装载段表/位图/dict_slots → 就绪。不扫描段文件。
-    pub fn write(&mut self, x: i32, z: i32, type_id: u16, nbt: &[u8]) -> Result<(), VaultError>;
+    pub fn write(&mut self, x: i32, z: i32, type_id: u16, nbt: &[u8]) -> Result<(), StrataError>;
     // 压缩（当前 hot 配置 + 字典槽）→ gen → 段写（滚动）→ epoch.record → 位图 set → 索引 put
-    pub fn read(&self, x: i32, z: i32, type_id: u16) -> Result<Option<Vec<u8>>, VaultError>;
+    pub fn read(&self, x: i32, z: i32, type_id: u16) -> Result<Option<Vec<u8>>, StrataError>;
     // 逐段位图判存在（无→None，零 IO）→ sieve/磁盘索引页定位 → 段读 → hash 校验 → 解压
-    pub fn flush(&mut self) -> Result<(), VaultError>; // fsync 段 → epoch++ → manifest.save → epoch.rotate
-    pub fn rebuild_index_from_scan(&mut self) -> Result<u64, VaultError>; // 恢复专用：全扫描重建，返回记录数
-    pub fn verify(&self) -> Result<VerifyReport, VaultError>;
+    pub fn flush(&mut self) -> Result<(), StrataError>; // fsync 段 → epoch++ → manifest.save → epoch.rotate
+    pub fn rebuild_index_from_scan(&mut self) -> Result<u64, StrataError>; // 恢复专用：全扫描重建，返回记录数
+    pub fn verify(&self) -> Result<VerifyReport, StrataError>;
 }
 ```
 
@@ -732,7 +732,7 @@ fn corrupted_manifest_triggers_scan_rebuild() {
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core --test roundtrip`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core --test roundtrip`
 
 - [ ] **Step 3: 实现 `store.rs`**
 要点：
@@ -741,12 +741,12 @@ fn corrupted_manifest_triggers_scan_rebuild() {
 - `write` 字典：`dictionary=true` 且该 type 有字典槽 → comp_id 带槽位；无字典 → slot 0。
 - `read` 命中 `payload_hash==0`（损坏标记）→ `Ok(None)`。
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core`，全部 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core`，全部 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): Store facade with three-tier index and no-scan startup"
+git add crates/strata-core && git commit -m "feat(core): Store facade with three-tier index and no-scan startup"
 ```
 
 ---
@@ -754,8 +754,8 @@ git add crates/vault-core && git commit -m "feat(core): Store facade with three-
 ### Task 11: 三档 GC（hole-punch / 删除 / 打分压实）
 
 **Files:**
-- Create: `crates/vault-core/src/gc.rs`
-- Test: `crates/vault-core/tests/gc.rs`
+- Create: `crates/strata-core/src/gc.rs`
+- Test: `crates/strata-core/tests/gc.rs`
 
 **Interfaces:**
 - Consumes: Store、punch、Index
@@ -766,7 +766,7 @@ pub struct GcConfig { pub invalid_threshold: f64, pub budget_bytes: u64, pub min
 pub struct GcStats { pub reclaimed_bytes: u64, pub segments_removed: u32,
                      pub holes_punched: u32, pub records_moved: u64 }
 impl Store {
-    pub fn gc_pass(&mut self, cfg: &GcConfig) -> Result<GcStats, VaultError>;
+    pub fn gc_pass(&mut self, cfg: &GcConfig) -> Result<GcStats, StrataError>;
     pub fn touch_stats(&self) -> (u64 /*live*/, u64 /*total*/);
 }
 ```
@@ -798,16 +798,16 @@ fn nearly_dead_segment_fully_removed() {
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core --test gc`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core --test gc`
 
 - [ ] **Step 3: 实现 `gc.rs`**（live 统计：遍历索引按 seg_id 聚合；死区间图：压实扫描时顺手构建每段 valid bitset）
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core`，全部 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core`，全部 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): three-tier GC (hole punch / drop / scored compaction)"
+git add crates/strata-core && git commit -m "feat(core): three-tier GC (hole punch / drop / scored compaction)"
 ```
 
 ---
@@ -815,8 +815,8 @@ git add crates/vault-core && git commit -m "feat(core): three-tier GC (hole punc
 ### Task 12: 冷层分块固态归档（superfeatures + 字典）
 
 **Files:**
-- Create: `crates/vault-core/src/cold.rs`
-- Test: `crates/vault-core/tests/cold.rs`
+- Create: `crates/strata-core/src/cold.rs`
+- Test: `crates/strata-core/tests/cold.rs`
 
 **Interfaces:**
 - Consumes: codec、dict、Envelope
@@ -828,16 +828,16 @@ pub struct ArchiveBuilder { /* 收集 region 记录，superfeatures 排序 */ }
 impl ArchiveBuilder {
     pub fn new(region_x: i32, region_z: i32, level: i32, dict: Option<Vec<u8>>) -> Self;
     pub fn add(&mut self, env: Envelope, nbt: Vec<u8>);
-    pub fn finish(self, path: &Path) -> Result<ArchiveSummary { blocks: u32, compressed_bytes: u64, plain_bytes: u64 }, VaultError>;
+    pub fn finish(self, path: &Path) -> Result<ArchiveSummary { blocks: u32, compressed_bytes: u64, plain_bytes: u64 }, StrataError>;
 }
 pub struct ArchiveReader { /* 块级读取 + SIEVE 块缓存钩子 */ }
 impl ArchiveReader {
-    pub fn open(path: &Path) -> Result<Self, VaultError>;
-    pub fn get(&mut self, x: i32, z: i32, type_id: u16) -> Result<Option<Vec<u8>>, VaultError>; // 只解压目标块
-    pub fn invalidate(&mut self, x: i32, z: i32, type_id: u16) -> Result<bool, VaultError>;    // .varc.inv 位图
+    pub fn open(path: &Path) -> Result<Self, StrataError>;
+    pub fn get(&mut self, x: i32, z: i32, type_id: u16) -> Result<Option<Vec<u8>>, StrataError>; // 只解压目标块
+    pub fn invalidate(&mut self, x: i32, z: i32, type_id: u16) -> Result<bool, StrataError>;    // .varc.inv 位图
     pub fn invalid_count(&self) -> u32;
     pub fn total_slots(&self) -> u32;
-    pub fn extract_all(&mut self) -> Result<Vec<(Envelope, Vec<u8>)>, VaultError>;
+    pub fn extract_all(&mut self) -> Result<Vec<(Envelope, Vec<u8>)>, StrataError>;
     pub fn max_block_plain_bytes(&self) -> u64; // 冷读内存上界观测
 }
 ```
@@ -861,18 +861,18 @@ fn superfeatures_ordering_improves_compression() {
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core --test cold`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core --test cold`
 
 - [ ] **Step 3: 实现 `cold.rs`**
 - `finish`：superfeatures 排序 → 按 64 条一块切分 → 每块内 `信封序列 + NBT` 拼接后 zstd（带字典可选）→ 写文件（先写槽表再写块，块偏移回填两次 pass 或先缓冲）。
 - `get`：槽表二分（坐标+type）→ 块号 → 读块 → 解压到块缓存（`Vec<u8>`，容量由 Store 的 cache 预算管理，Phase 1 简化为单块最近缓存）→ 切片。
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core --test cold`，2 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core --test cold`，2 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): blocked cold archive with superfeatures ordering"
+git add crates/strata-core && git commit -m "feat(core): blocked cold archive with superfeatures ordering"
 ```
 
 ---
@@ -880,8 +880,8 @@ git add crates/vault-core && git commit -m "feat(core): blocked cold archive wit
 ### Task 13: 热↔冷迁移策略
 
 **Files:**
-- Create: `crates/vault-core/src/tier.rs`
-- Test: `crates/vault-core/tests/tier.rs`
+- Create: `crates/strata-core/src/tier.rs`
+- Test: `crates/strata-core/tests/tier.rs`
 
 **Interfaces:**
 - Consumes: Tasks 10/11/12
@@ -891,7 +891,7 @@ pub struct TierConfig { pub enabled: bool, pub stable_flushes: u32, pub invalid_
 // 默认 true / 30 / 0.25
 pub struct TierStats { pub promoted: u32, pub demoted: u32, pub bytes_cold: u64 }
 impl Store {
-    pub fn tier_pass(&mut self, cfg: &TierConfig) -> Result<TierStats, VaultError>;
+    pub fn tier_pass(&mut self, cfg: &TierConfig) -> Result<TierStats, StrataError>;
     // cfg.enabled=false → 直接返回空 stats（纯热模式）
     // 晋升：region 全部槽位在热索引/位图中均 Stable → ArchiveBuilder → fsync → 注册 ColdMeta + 位图/索引清理 → epoch 记录
     // 降级：invalid_count/total_slots > ratio → extract_all → 重写热层 → 删归档与 ColdMeta
@@ -901,16 +901,16 @@ impl Store {
 
 - [ ] **Step 1: 写失败测试** `tests/tier.rs`（stable_region_promotes_to_cold_and_reads_back / rewrite_backfills_hot_and_counts_invalid / heavy_invalidation_demotes_archive / tiering_disabled_never_promotes 四例）
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-core --test tier`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-core --test tier`
 
 - [ ] **Step 3: 实现 `tier.rs`**（晋升事务性：先归档+fsync，再改 manifest；失败回滚删归档）
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-core`，全部 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-core`，全部 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-core && git commit -m "feat(core): hot/cold tier migration with demotion"
+git add crates/strata-core && git commit -m "feat(core): hot/cold tier migration with demotion"
 ```
 
 ---
@@ -918,7 +918,7 @@ git add crates/vault-core && git commit -m "feat(core): hot/cold tier migration 
 ### Task 14: Anvil 读写器（CLI 依赖）
 
 **Files:**
-- Create: `crates/vault-cli/src/anvil.rs`
+- Create: `crates/strata-cli/src/anvil.rs`
 - Test: 内嵌 `#[cfg(test)]`
 
 **Interfaces:**
@@ -926,41 +926,41 @@ git add crates/vault-core && git commit -m "feat(core): hot/cold tier migration 
 
 - [ ] **Step 1: 写失败测试**（anvil_write_read_roundtrip + empty_slots_skipped，同 v1）
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-cli anvil`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-cli anvil`
 
 - [ ] **Step 3: 实现**（位置表分配从扇区 2 起；版本 1/2/3/4 = gzip/deflate/none/lz4 用 flate2/lz4_flex）
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-cli`，2 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-cli`，2 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-cli && git commit -m "feat(cli): anvil .mca reader/writer"
+git add crates/strata-cli && git commit -m "feat(cli): anvil .mca reader/writer"
 ```
 
 ---
 
-### Task 15: vault.properties 配置加载器 + 组合矩阵
+### Task 15: strata.properties 配置加载器 + 组合矩阵
 
 **Files:**
-- Create: `crates/vault-cli/src/config.rs`
+- Create: `crates/strata-cli/src/config.rs`
 - Test: 内嵌 `#[cfg(test)]`
 
 **Interfaces:**
-- Consumes: vault-core `StoreConfig`/`GcConfig`/`TierConfig`
+- Consumes: strata-core `StoreConfig`/`GcConfig`/`TierConfig`
 - Produces:
 ```rust
 #[derive(Debug, Clone, PartialEq)]
-pub struct VaultConfig {
+pub struct StrataConfig {
     pub enabled: bool,               // 默认 false
     pub tier: TierConfig,
     pub store: StoreConfig,          // hot_level/hot_enabled/cold_level/cold_enabled/dictionary/cache_mb
     pub gc: GcConfig,
 }
-pub fn load_or_create_template(world_root: &Path) -> Result<VaultConfig, VaultError>;
+pub fn load_or_create_template(world_root: &Path) -> Result<StrataConfig, StrataError>;
 // 无文件 → 写注释模板 + 返回默认；有文件 → 解析（'#'/'!' 注释、'\' 续行、首个 '=' 分割）
-// 未知 key 告警忽略；非法值 → VaultError::Config{file, line, detail}
-pub fn validate_matrix(cfg: &VaultConfig) -> Vec<String>; // 返回 WARN 列表（规格 §9 矩阵）
+// 未知 key 告警忽略；非法值 → StrataError::Config{file, line, detail}
+pub fn validate_matrix(cfg: &StrataConfig) -> Vec<String>; // 返回 WARN 列表（规格 §9 矩阵）
 // enabled=false → 忽略其余；tiering=false → 忽略 cold 并提示；压缩全关 → WARN 体积；冷关热开 → WARN
 ```
 模板（与规格 §9 完全一致，含注释）。级别校验：zstd 级别 -10..=22，0 非法。
@@ -973,24 +973,24 @@ fn missing_file_creates_template_with_disabled_default() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = load_or_create_template(dir.path()).unwrap();
     assert!(!cfg.enabled); // 默认关
-    let text = std::fs::read_to_string(dir.path().join("vault.properties")).unwrap();
-    assert!(text.contains("vault.enabled=false"));
+    let text = std::fs::read_to_string(dir.path().join("strata.properties")).unwrap();
+    assert!(text.contains("strata.enabled=false"));
 }
 
 #[test]
 fn level_bounds_enforced() {
     for bad in ["zstd-0", "zstd-23", "zstd--11", "lz4"] {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("vault.properties"),
-            format!("vault.compression.hot={bad}\n")).unwrap();
+        std::fs::write(dir.path().join("strata.properties"),
+            format!("strata.compression.hot={bad}\n")).unwrap();
         let e = load_or_create_template(dir.path()).unwrap_err();
-        assert!(matches!(e, VaultError::Config { line: 1, .. }));
+        assert!(matches!(e, StrataError::Config { line: 1, .. }));
     }
 }
 
 #[test]
 fn matrix_warns_on_all_compression_off() {
-    let cfg = VaultConfig { enabled: true, store: StoreConfig { hot_enabled: false, .. }, .. };
+    let cfg = StrataConfig { enabled: true, store: StoreConfig { hot_enabled: false, .. }, .. };
     let warns = validate_matrix(&cfg);
     assert!(warns.iter().any(|w| w.contains("压缩全部关闭")));
 }
@@ -998,39 +998,39 @@ fn matrix_warns_on_all_compression_off() {
 #[test]
 fn disabled_ignores_rest() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("vault.properties"),
-        "vault.enabled=false\nvault.compression.hot=not-a-level\n").unwrap();
+    std::fs::write(dir.path().join("strata.properties"),
+        "strata.enabled=false\nstrata.compression.hot=not-a-level\n").unwrap();
     let cfg = load_or_create_template(dir.path()).unwrap(); // 不报错：enabled=false 忽略其余
     assert!(!cfg.enabled);
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-cli config`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-cli config`
 
 - [ ] **Step 3: 实现 `config.rs`**（解析器 + 映射层 + 矩阵）
 
-- [ ] **Step 4: 确认通过** — Run: `cargo test -p vault-cli config`，4 PASS
+- [ ] **Step 4: 确认通过** — Run: `cargo test -p strata-cli config`，4 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-cli && git commit -m "feat(cli): vault.properties loader with validation matrix"
+git add crates/strata-cli && git commit -m "feat(cli): strata.properties loader with validation matrix"
 ```
 
 ---
 
-### Task 16: vault-cli（Cesium 式转换/verify/compact/stats）
+### Task 16: strata-cli（Cesium 式转换/verify/compact/stats）
 
 **Files:**
-- Modify: `crates/vault-cli/src/main.rs`
-- Create: `crates/vault-cli/tests/cli.rs`
+- Modify: `crates/strata-cli/src/main.rs`
+- Create: `crates/strata-cli/tests/cli.rs`
 
 **Interfaces:**
 - Consumes: Store、anvil、config
-- Produces: `vault_cli::run(&[&str]) -> anyhow::Result<()>`；子命令：
-  - `convert --to-vault <world>` / `convert --to-anvil <world>`：Cesium 式覆盖、保留源、进度恢复（`vstore/.convert-progress`，每 region 一行 + fsync，完成删除）
+- Produces: `strata_cli::run(&[&str]) -> anyhow::Result<()>`；子命令：
+  - `convert --to-strata <world>` / `convert --to-anvil <world>`：Cesium 式覆盖、保留源、进度恢复（`vstore/.convert-progress`，每 region 一行 + fsync，完成删除）
   - `verify <world>` / `compact <world>`（gc_pass+tier_pass 直到收敛）/ `stats <world>`
-- 行为契约：覆盖前先删 `vstore/`（to-vault）或逐 `.mca` 临时文件 rename（to-anvil）；结束打印"源格式文件已保留：<列表>，请验证后手动删除"；Phase 1 仅 overworld，遇 DIM-1 报暂不支持；配置经 `load_or_create_template`；`validate_matrix` 的 WARN 打到 stderr；type_id 映射 0=chunk 1=entities 2=poi。
+- 行为契约：覆盖前先删 `vstore/`（to-strata）或逐 `.mca` 临时文件 rename（to-anvil）；结束打印"源格式文件已保留：<列表>，请验证后手动删除"；Phase 1 仅 overworld，遇 DIM-1 报暂不支持；配置经 `load_or_create_template`；`validate_matrix` 的 WARN 打到 stderr；type_id 映射 0=chunk 1=entities 2=poi。
 
 - [ ] **Step 1: 写失败测试** `tests/cli.rs`
 
@@ -1044,7 +1044,7 @@ fn synth_anvil_world(world: &std::path::Path) {
 }
 
 #[test]
-fn convert_to_vault_preserves_anvil_and_overwrites() { /* 同 v1：源文件保留 + vstore 生成 + 重复执行幂等 */ }
+fn convert_to_strata_preserves_anvil_and_overwrites() { /* 同 v1：源文件保留 + vstore 生成 + 重复执行幂等 */ }
 
 #[test]
 fn convert_roundtrip_preserves_all_types() { /* 同 v1：删 region/ 再转回验证来自 vstore */ }
@@ -1054,12 +1054,12 @@ fn interrupted_conversion_resumes() { /* 预置进度文件 → 已完成 region
 
 #[test]
 fn convert_requires_enabled_config() {
-    // 世界根 vault.properties 缺省（默认 enabled=false）→ convert 命令仍执行（转换不依赖 enabled，
-    // 但结束时 WARN："vault.enabled=false，转换后记得在 vault.properties 中启用"）
+    // 世界根 strata.properties 缺省（默认 enabled=false）→ convert 命令仍执行（转换不依赖 enabled，
+    // 但结束时 WARN："strata.enabled=false，转换后记得在 strata.properties 中启用"）
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-cli --test cli`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p strata-cli --test cli`
 
 - [ ] **Step 3: 实现**（main.rs 用 clap derive；`lib.rs` 暴露 `run` 与 `pub mod anvil`）
 
@@ -1068,7 +1068,7 @@ fn convert_requires_enabled_config() {
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-cli && git commit -m "feat(cli): Cesium-style in-place conversion preserving source format"
+git add crates/strata-cli && git commit -m "feat(cli): Cesium-style in-place conversion preserving source format"
 ```
 
 ---
@@ -1076,21 +1076,21 @@ git add crates/vault-cli && git commit -m "feat(cli): Cesium-style in-place conv
 ### Task 17: 基准（vs Anvil，含内存曲线）
 
 **Files:**
-- Create: `crates/vault-cli/benches/vs_anvil.rs`, `benches/RESULTS.md`
+- Create: `crates/strata-cli/benches/vs_anvil.rs`, `benches/RESULTS.md`
 
 **Interfaces:**
 - Consumes: 全部
 - Produces: criterion 报告：
-  1. **体积**：合成世界 4096 chunk → Anvil 字节 vs `convert --to-vault` + `compact` 后 `vstore/` 字节（目标 ≤0.65×）
+  1. **体积**：合成世界 4096 chunk → Anvil 字节 vs `convert --to-strata` + `compact` 后 `vstore/` 字节（目标 ≤0.65×）
   2. **写吞吐**：10k 次随机 write+flush
   3. **读延迟**：1k 次随机 read p50/p99（含冷读）
   4. **内存曲线**：`cache-mb=64` 下插入 10 万条目后 `SieveCache::len_bytes` 上界断言 + 进程 RSS 采样（Windows 用 GetProcessMemoryInfo）——验证与世界大小无关
 
-- [ ] **Step 1: 写基准代码**（synth_world 生成 .mca；bench_footprint/bench_write_throughput/bench_read_latency/bench_memory_bound 四组；footprint 用 `convert --to-vault` 路径）
+- [ ] **Step 1: 写基准代码**（synth_world 生成 .mca；bench_footprint/bench_write_throughput/bench_read_latency/bench_memory_bound 四组；footprint 用 `convert --to-strata` 路径）
 
 - [ ] **Step 2: 运行基准**
 
-Run: `cargo bench -p vault-cli`
+Run: `cargo bench -p strata-cli`
 Expected: 体积比 ≤0.65×、无 panic、RSS 曲线平坦
 
 - [ ] **Step 3: 结果记录到 `benches/RESULTS.md`**（机器信息、日期、四组数字）
@@ -1098,7 +1098,7 @@ Expected: 体积比 ≤0.65×、无 panic、RSS 曲线平坦
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/vault-cli/benches benches/RESULTS.md && git commit -m "bench: vault vs anvil footprint/throughput/latency/memory"
+git add crates/strata-cli/benches benches/RESULTS.md && git commit -m "bench: strata vs anvil footprint/throughput/latency/memory"
 ```
 
 ---

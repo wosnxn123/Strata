@@ -1,10 +1,10 @@
-# Vault —— Minecraft 服务端 Rust 混合双层存储引擎设计
+# Strata —— Minecraft 服务端 Rust 混合双层存储引擎设计
 
 **状态**: 设计 v2（架构重写，整合 2024–2026 文献与全部已确认需求）
 **日期**: 2026-08-04（v2 重写）
 **目标基线**: Canvas (Folia fork) 26.2+，后续 Paper / Arclight 适配
 **形态**: 进程内 Rust 原生库（JNI），嵌入 JVM 服务端
-**默认状态**: **关闭**（`vault.enabled=false`），需显式启用
+**默认状态**: **关闭**（`strata.enabled=false`），需显式启用
 
 ---
 
@@ -61,14 +61,14 @@ Minecraft 服务端默认 Anvil (`.mca`) 格式存在三类结构性问题：
 | 一致性模型 | 原版等价 + 原子记录（epoch 对齐 autosave） |
 | 架构方案 | 混合双层：热层段日志 + 冷层分块固态归档 |
 | 目标基线 | Canvas (Folia) 26.2+ 优先 |
-| 默认启用 | **false**（`vault.enabled=false`，显式启用） |
+| 默认启用 | **false**（`strata.enabled=false`，显式启用） |
 | 转换行为 | Cesium 式：启动参数/CLI 触发、原地覆盖、**源格式保留需手动删除** |
-| 配置载体 | 世界根目录 `vault.properties`（Java properties 格式） |
+| 配置载体 | 世界根目录 `strata.properties`（Java properties 格式） |
 | 内存模型 | 有界：常驻 ~几十 MB + `cache-mb` 可配缓存，与世界大小无关 |
 
 ### 存储引擎形态说明
 
-Vault 的热层段日志**就是存储引擎本体**（自带索引/GC/崩溃恢复，等价于专用数据库）。不引入通用嵌入式 KV（LMDB/RocksDB/redb）——通用引擎的 B+ 树 CoW 写放大、单写者事务、冷热混排均不适配 MC chunk 负载（大 blob、空间聚集、region 对齐）。不存在"关闭两层只用数据库"的状态：关引擎即 `vault.enabled=false` 回 Anvil。
+Strata 的热层段日志**就是存储引擎本体**（自带索引/GC/崩溃恢复，等价于专用数据库）。不引入通用嵌入式 KV（LMDB/RocksDB/redb）——通用引擎的 B+ 树 CoW 写放大、单写者事务、冷热混排均不适配 MC chunk 负载（大 blob、空间聚集、region 对齐）。不存在"关闭两层只用数据库"的状态：关引擎即 `strata.enabled=false` 回 Anvil。
 
 ---
 
@@ -91,7 +91,7 @@ graph TB
         FFI --> RECOV
     end
     subgraph TOOLING["工具链"]
-        CLI["vault-cli：Cesium 式转换 / verify / compact / stats"]
+        CLI["strata-cli：Cesium 式转换 / verify / compact / stats"]
     end
     SHIM -- "JNI 零拷贝 NBT blob" --> FFI
     CLI --> FFI
@@ -101,10 +101,10 @@ graph TB
 
 | crate | 职责 |
 |---|---|
-| `vault-core` | 容器格式、段引擎、三层索引、GC、冷归档、恢复——纯 Rust，零 JVM 依赖 |
-| `vault-ffi` | C ABI + JNI 桥，所有跨边界调用 `catch_unwind` 包裹（Phase 2） |
-| `vault-cli` | Cesium 式双向转换器、`verify`、`compact`、`stats`、`vault.properties` 加载器 |
-| `vault-plugin-canvas`（Java） | Canvas/Folia 集成 shim（Phase 2） |
+| `strata-core` | 容器格式、段引擎、三层索引、GC、冷归档、恢复——纯 Rust，零 JVM 依赖 |
+| `strata-ffi` | C ABI + JNI 桥，所有跨边界调用 `catch_unwind` 包裹（Phase 2） |
+| `strata-cli` | Cesium 式双向转换器、`verify`、`compact`、`stats`、`strata.properties` 加载器 |
+| `strata-plugin-canvas`（Java） | Canvas/Folia 集成 shim（Phase 2） |
 
 ### 磁盘布局（每 dimension 一个存储池）
 
@@ -141,7 +141,7 @@ world/dimensions/minecraft/overworld/
 │  每段 region 占用位图：128B/region/type                     │
 │    → 未生成 chunk 负查询 O(1) 位操作，零磁盘 IO（MC 领域特化，│
 │      优于任何布隆/学习过滤器：位图精确且 1 bit/槽）           │
-├─ L1 有界缓存（vault.index.cache-mb，默认 512）──────────────┤
+├─ L1 有界缓存（strata.index.cache-mb，默认 512）─────────────┤
 │  热点索引页 —— SIEVE 淘汰（访问只置位、淘汰手扫描，           │
 │  Folia 多线程近乎免锁；NSDI'24 命中率 ≥LRU）                │
 ├─ L2 磁盘（无界）─────────────────────────────────────────────┤
@@ -260,33 +260,33 @@ Meterstick 证实 MC 负载高波动 → GC 默认按前台写压力自适应节
 
 ---
 
-## 9. 配置（vault.properties）
+## 9. 配置（strata.properties）
 
 世界根目录（与 level.dat 同级），Java properties 格式（`key=value`，`#` 注释）。CLI 与服务端 shim 共用同一加载器。**启动时加载**（不做热重载——存储参数中途切换易生歧义）；缺失文件 → 生成带注释模板 + 全默认。
 
 ```properties
 # 总开关（默认 false——必须显式启用）
-vault.enabled=false
+strata.enabled=false
 # 冷层（轴 1：容器分层）
-vault.tiering.enabled=true
-vault.tiering.stable-flushes=30
-vault.tiering.invalid-demote-ratio=0.25
+strata.tiering.enabled=true
+strata.tiering.stable-flushes=30
+strata.tiering.invalid-demote-ratio=0.25
 # 压缩（轴 2：与轴 1 正交）
-vault.compression.hot-enabled=true
-vault.compression.cold-enabled=true
-vault.compression.hot=zstd-3
-vault.compression.cold=zstd-9
-vault.compression.dictionary=true
+strata.compression.hot-enabled=true
+strata.compression.cold-enabled=true
+strata.compression.hot=zstd-3
+strata.compression.cold=zstd-9
+strata.compression.dictionary=true
 # 索引内存上界
-vault.index.cache-mb=512
+strata.index.cache-mb=512
 # GC
-vault.gc.enabled=true
-vault.gc.invalid-threshold=0.6
-vault.gc.budget-bytes=33554432
+strata.gc.enabled=true
+strata.gc.invalid-threshold=0.6
+strata.gc.budget-bytes=33554432
 ```
 
 **级别范围**：zstd -10 ~ 22（0 非法——"库默认"语义歧义；越界报行号错误）。
-**非法值** → 启动报错并指明 `vault.properties:<行号>: <原因>`，不静默回退。
+**非法值** → 启动报错并指明 `strata.properties:<行号>: <原因>`，不静默回退。
 
 ### 组合合法性矩阵
 
@@ -308,17 +308,17 @@ vault.gc.budget-bytes=33554432
 
 - 压缩级别/codec/字典：**随时可改**，只影响之后的写入；旧记录按自身 comp_id 读取（混存合法）。读取永不回写 → 路过旧区域不触发重压；只有"改动后保存 / 冷层晋升降级 / 显式转换"三条路径用新配置。
 - GC/tiering 参数：运行时调优，影响后续轮次。
-- `enabled=false` 前提：先跑 `--vaultConvertToAnvil` 转回 Anvil，否则加载到旧快照（转换器章节说明）。
+- `enabled=false` 前提：先跑 `--strataConvertToAnvil` 转回 Anvil，否则加载到旧快照（转换器章节说明）。
 
 ---
 
 ## 10. 迁移与转换器（Cesium 式行为）
 
-- **触发**：服务端启动参数 `--vaultConvertToVault` / `--vaultConvertToAnvil`（Phase 2 shim 解析）；CLI 等价命令 `vault-cli convert --to-vault <world>` / `--to-anvil <world>`。转换在启动前同步执行，完成后继续启动。
+- **触发**：服务端启动参数 `--strataConvertToStrata` / `--strataConvertToAnvil`（Phase 2 shim 解析）；CLI 等价命令 `strata-cli convert --to-strata <world>` / `--to-anvil <world>`。转换在启动前同步执行，完成后继续启动。
 - **原地覆盖**：输出写到同一世界目录目标存储；目标已存在**直接覆盖重建**（与 Cesium wiki 一致）。重复执行同方向转换 = 重新生成；转换后应移除启动参数，否则下次启动再次覆盖。
 - **保留源格式**：转换**绝不删除**源（`region/`/`entities/`/`poi/` 或 `vstore/`），运维验证后**手动删除**；结束时打印醒目提示与源目录列表。
 - **可恢复进度**：每 region 完成追加 `vstore/.convert-progress` 一行 + fsync；中断重跑跳过已完成；全部完成后删除进度文件。
-- **全量 + 当前配置**：遍历所有 region/entities/poi `.mca`，按当前 `vault.properties` 压缩级别写 vstore；反向转 Anvil 固定 DEFLATE（Anvil 不支持 zstd）。中断期间改配置会造成混级别（合法但不一致）。
+- **全量 + 当前配置**：遍历所有 region/entities/poi `.mca`，按当前 `strata.properties` 压缩级别写 vstore；反向转 Anvil 固定 DEFLATE（Anvil 不支持 zstd）。中断期间改配置会造成混级别（合法但不一致）。
 - Phase 1 CLI 仅支持 overworld 维度；DIM-1 等报"暂不支持"。
 
 ---
@@ -337,7 +337,7 @@ vault.gc.budget-bytes=33554432
 
 ### 测试
 
-- `vault-core` 单元 + property-based fuzz（proptest；信封编解码、段追加/扫描、索引、GC、恢复）。
+- `strata-core` 单元 + property-based fuzz（proptest；信封编解码、段追加/扫描、索引、GC、恢复）。
 - 崩溃注入：随机在写入/fsync/epoch 切换点 kill，验证三级恢复。
 - 基准（criterion）：vs Anvil 体积（目标 ≤0.65×）/写吞吐/读延迟 p50·p99；合成世界 4096 chunk。
 - 集成（Phase 2）：Canvas 实服跑图 + 插件兼容性矩阵（Multiverse 等）。
@@ -360,6 +360,6 @@ vault.gc.budget-bytes=33554432
 
 - 学习索引（Bourbon/CARMI 完整版）：键空间泛化时再评估
 - per-type 之外的多字典策略 / lzma2 冷层 codec（注册表已留扩展位）
-- `vault-cli recompress <world>` 全量重压维护命令
+- `strata-cli recompress <world>` 全量重压维护命令
 - Nether/End 维度转换（Phase 1 仅 overworld）
 - playerdata/stats/advancements/savedata 纳入（Phase 1 仅三大件，信封 type_id 已预留）
