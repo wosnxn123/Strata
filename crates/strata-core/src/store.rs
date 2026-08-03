@@ -331,7 +331,7 @@ impl Store {
         if self
             .writer
             .as_ref()
-            .map_or(false, |w| w.offset() >= self.cfg.segment_max_bytes)
+            .is_some_and(|w| w.offset() >= self.cfg.segment_max_bytes)
         {
             let mut w = self.writer.take().expect("checked Some above");
             w.fsync()?;
@@ -371,7 +371,7 @@ impl Store {
                 }
             }
             if let Some(v) = cand {
-                if best.map_or(true, |b| v.gen > b.gen) {
+                if best.is_none_or(|b| v.gen > b.gen) {
                     best = Some(v);
                 }
             }
@@ -445,7 +445,7 @@ impl Store {
 
         let ids: Vec<u32> = self.segs.keys().copied().collect();
         for id in ids {
-            if self.segs.get(&id).map_or(true, |s| s.incremental.is_empty()) {
+            if self.segs.get(&id).is_none_or(|s| s.incremental.is_empty()) {
                 continue;
             }
             // 旧页：优先缓存，回落磁盘。
@@ -458,7 +458,7 @@ impl Store {
             let mut entries: Vec<(IndexKey, IndexVal)> = old.iter().cloned().collect();
             {
                 let st = self.segs.get_mut(&id).expect("iterated from segs");
-                entries.extend(st.incremental.drain(..));
+                entries.append(&mut st.incremental);
             }
             // from_entries 排序并对同键保留最大 gen。
             let page = Arc::new(IndexPage::from_entries(entries));
@@ -640,7 +640,7 @@ impl Store {
         for m in self.manifest.segments.iter_mut() {
             m.live_bytes = 0;
         }
-        for (_, v) in &latest {
+        for v in latest.values() {
             if let Some(m) = self.manifest.segments.iter_mut().find(|m| m.id == v.seg_id) {
                 m.live_bytes += ENVELOPE_SIZE as u64 + v.payload_len as u64;
             }

@@ -265,7 +265,7 @@ impl Store {
         for (&seg_id, st) in &self.segs {
             let page_has = self
                 .load_page(seg_id)?
-                .map_or(false, |p| p.iter().any(|(k, _)| in_region(k)));
+                .is_some_and(|p| p.iter().any(|(k, _)| in_region(k)));
             let inc_has = st.incremental.iter().any(|(k, _)| in_region(k));
             if page_has || inc_has {
                 touched.push(seg_id);

@@ -96,7 +96,29 @@ mod windows {
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
 
-    use windows_sys::Win32::Storage::FileSystem::{DeviceIoControl, FILE_ZERO_DATA_INFORMATION};
+    // 手写 FFI 绑定（windows-sys 0.59 的 feature 组合下这两项不稳定）。
+    type BOOL = i32;
+    type HANDLE = *mut std::ffi::c_void;
+
+    #[repr(C)]
+    struct FileZeroDataInformation {
+        file_offset: i64,
+        beyond_final_zero: i64,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn DeviceIoControl(
+            h_device: HANDLE,
+            dw_io_control_code: u32,
+            in_buffer: *const std::ffi::c_void,
+            n_in_buffer_size: u32,
+            out_buffer: *mut std::ffi::c_void,
+            n_out_buffer_size: u32,
+            bytes_returned: *mut u32,
+            overlapped: *mut std::ffi::c_void,
+        ) -> BOOL;
+    }
 
     use super::{PunchOutcome, StrataError};
 
@@ -111,7 +133,7 @@ mod windows {
         // punch_hole 已保证 offset + len 不溢出。
         let end = offset + len;
 
-        let handle = file.as_raw_handle();
+        let handle = file.as_raw_handle() as HANDLE;
         let mut ret: u32 = 0;
 
         // 1) 设置稀疏属性；失败（例如卷不支持稀疏文件）→ Unsupported。
@@ -132,16 +154,16 @@ mod windows {
         }
 
         // 2) 将 [offset, end) 归零（稀疏卷上会真正释放磁盘空间）。
-        let info = FILE_ZERO_DATA_INFORMATION {
-            FileOffset: offset as i64,
-            BeyondFinalZero: end as i64,
+        let info = FileZeroDataInformation {
+            file_offset: offset as i64,
+            beyond_final_zero: end as i64,
         };
         let ok = unsafe {
             DeviceIoControl(
                 handle,
                 FSCTL_SET_ZERO_DATA,
-                &info as *const FILE_ZERO_DATA_INFORMATION as *const std::ffi::c_void,
-                size_of::<FILE_ZERO_DATA_INFORMATION>() as u32,
+                &info as *const FileZeroDataInformation as *const std::ffi::c_void,
+                size_of::<FileZeroDataInformation>() as u32,
                 std::ptr::null_mut(),
                 0,
                 &mut ret,
