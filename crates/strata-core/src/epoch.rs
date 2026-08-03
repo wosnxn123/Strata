@@ -70,10 +70,10 @@ impl EpochLog {
     pub fn record(&mut self, e: &EpochEntry) -> Result<(), StrataError> {
         let mut buf = [0u8; ENTRY_SIZE]; // zero padding pre-filled
         buf[OFF_SEG_ID..OFF_SEG_ID + 4].copy_from_slice(&e.seg_id.to_le_bytes());
-        let env_slot: &mut [u8; ENVELOPE_SIZE] = buf[OFF_ENV..OFF_ENV + ENVELOPE_SIZE]
-            .try_into()
-            .expect("fixed slice length");
-        e.env.encode(env_slot);
+        let mut env_buf = [0u8; ENVELOPE_SIZE];
+        env_buf.copy_from_slice(&buf[OFF_ENV..OFF_ENV + ENVELOPE_SIZE]);
+        e.env.encode(&mut env_buf);
+        buf[OFF_ENV..OFF_ENV + ENVELOPE_SIZE].copy_from_slice(&env_buf);
         buf[OFF_OFFSET..OFF_OFFSET + 8].copy_from_slice(&e.offset.to_le_bytes());
         self.w.write_all(&buf)?;
         self.w.flush()?;
