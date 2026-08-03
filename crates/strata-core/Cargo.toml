@@ -7,6 +7,8 @@ edition = "2021"
 zstd = { workspace = true }
 xxhash-rust = { workspace = true }
 thiserror = { workspace = true }
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
