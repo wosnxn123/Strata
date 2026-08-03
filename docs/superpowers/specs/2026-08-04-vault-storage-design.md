@@ -1,9 +1,10 @@
 # Vault —— Minecraft 服务端 Rust 混合双层存储引擎设计
 
-**状态**: 设计（待审阅）
-**日期**: 2026-08-04
+**状态**: 设计 v2（架构重写，整合 2024–2026 文献与全部已确认需求）
+**日期**: 2026-08-04（v2 重写）
 **目标基线**: Canvas (Folia fork) 26.2+，后续 Paper / Arclight 适配
 **形态**: 进程内 Rust 原生库（JNI），嵌入 JVM 服务端
+**默认状态**: **关闭**（`vault.enabled=false`），需显式启用
 
 ---
 
@@ -15,30 +16,42 @@ Minecraft 服务端默认 Anvil (`.mca`) 格式存在三类结构性问题：
 2. **头部脆弱**：region 头部损坏即丢失全部定位信息，原版无恢复逻辑。
 3. **写放大与同步 fsync**：就地更新 + 逐 chunk 同步写，IO 路径不友好。
 
-本项目基于 2024–2026 存储/数据库/文件系统顶会（USENIX FAST、OSDI、VLDB/CIDR）的最新成果，设计一套全新容器格式，目标：
+本项目基于 2024–2026 存储/数据库/文件系统顶会成果，设计一套全新容器格式，目标：
 
-- **体积最小**：混合双层（热层段日志 + 冷层固态归档），预期整体 45–55%。
-- **性能最优**：顺序追加写 + 生命周期分组 GC + 异步批量 IO。
+- **体积最小**：混合双层（热层段日志 + 冷层分块固态归档），预期整体 45–55%。
+- **内存有界**：存储层内存 **与世界大小无关**（原版 Paper 在 TB 级存档上的性质，严格保持）——这是支持 2b2t 级几十 TB 存档的硬前提。
+- **性能最优**：顺序追加写 + 生命周期分组 + 三档 GC + 异步批量 IO。
 - **长期兼容**：信封式记录，Rust 永不解析 NBT 内部，未来版本自动透传。
 - **插件透明**：Bukkit/Paper API 层完全无感知。
 - **崩溃安全**：与原版等价的 autosave 原子性 + epoch 回放恢复。
 
-### 学术依据（2024–2026）
+### 学术依据（2024–2026，含采纳/不采纳决定）
 
-| 原则 | 出处 | 映射到本设计 |
-|---|---|---|
-| 生命周期感知放置，GC 写放大 ↓23% | FAST'26 DOGI、FAST'24 MIDAS | 热层按 chunk 年龄/热度分桶落段 |
-| KV 值分离：小键热、大值冷 | WiscTree / BVLSM / AegonKV / VLDB | 内存索引（小）热，NBT blob（大）单独存 |
-| 自描述记录 + 逐条校验 | 工程印证（OSDI'25 崩溃一致性） | 信封自带坐标/类型/时间戳/xxhash |
-| 小扇区寻址空间效率 ≥95% | SectorFile 实测 | 段内紧凑追加，无扇区对齐浪费 |
-| 压缩选型 zstd（速度与比最优） | sbk 2026 实测（7800X3D） | 热层 zstd-3、冷层 zstd-9 + 字典 |
-| epoch/自然事务边界崩溃一致性 | FAST'25 Ananke（Best Paper）、OSDI'25 | 对齐 autosave 时机做 epoch |
-| 冷数据相似度聚类压缩 +42.6% | FAST'26 RubikFS | 冷层归档前聚类 + 字典压缩 |
-| 异步批量 IO / io_uring | FAST'26 AITURBO | 对齐 Moonrise 异步 IO 池 |
+| 文献 | 会议/年份 | 结论 | 决定 |
+|---|---|---|---|
+| DOGI | FAST'26 | 生命周期感知数据放置，GC 写放大 ↓23% | **采纳**：热层按年龄/热度分桶 |
+| DisCoGC | FAST'26（字节生产） | discard 式 GC 不搬移存活数据，TCO ↓20% | **采纳**：hole-punch 三档 GC |
+| ArceKV / ElasticLSM | VLDB'26 | 打分制在线压实决策，动态负载快 2.17–2.92× | **采纳简化版**：打分选受害者（不做多层弹性结构） |
+| SIEVE | NSDI'24 | FIFO 变体淘汰：命中率 ≥LRU、访问近乎免锁、O(1) 扫描 | **采纳**：索引页缓存淘汰（Folia 多线程友好） |
+| S3-FIFO | SOSP'23 | 三 FIFO 队列达 LRU 级命中率 | 备选，SIEVE 更简单 |
+| CARMI | VLDB'22 | 缓存感知学习索引，内存可调 | 理念采纳：`cache-mb` 可调上界 |
+| Bourbon | OSDI'20 | LSM 学习索引内存 ↓3× | **不采纳**：region 占用位图对 MC 坐标键空间是 O(1) 精确查询，优于任何学习索引 |
+| RocksDB partitioned index + block cache | 生产实践 | 索引落盘 + 有界缓存 → PB 级可跑 | **采纳**：三层索引模型 |
+| SlimDB | CMU | 紧凑前缀共享索引 | 参考：索引页前缀压缩 |
+| AutoCSF | arXiv 2026-03 | 偏斜负载内存最优索引 | **不采纳**：位图已精确且更省 |
+| RubikFS | FAST'26 | 相似度聚类压缩 +42.6% | **采纳轻量版**：superfeatures sketch 排序（不建相似度图） |
+| EROFS pcluster / zstd seekable | Linux 内核 2024 / 官方 | 块级压缩 + 块索引随机访问 | **采纳**：.varc 分块格式 |
+| Ananke | FAST'25（Best Paper） | 自然事务边界崩溃恢复 | **采纳**：epoch 对齐 autosave |
+| LavaStore | VLDB'24（字节生产） | 专用引擎 > 通用引擎；严格内存上界铁律 | 印证：不走 LMDB 路线 |
+| Meterstick | ICPE'23 | MC 类负载高波动、尾延迟敏感 | 印证：GC 默认自适应节流 |
+| F2FS node footer（源码实证） | FAST'15+ | 24B 自描述页脚 + checkpoint 版本链 | 印证：信封瘦身 52B→40B |
+| RocksDB WAL 7B 头 | 生产 | 头不含键、恢复靠上层 | 对照：我们保留自描述（扫描重建需要） |
+| sbk 2026 实测 | 社区基准 | zstd-9 48.8%、lzma2 45.6% 但慢 50× | 热 zstd-3 / 冷 zstd-9 的依据 |
+| NTFS FSCTL_SET_ZERO_DATA | Microsoft 文档 | Windows 打洞等效：稀疏置零，粒度 64KB | **采纳**：GC 挖洞跨平台双实现 |
 
 ---
 
-## 2. 关键决策（已与需求方确认）
+## 2. 关键决策（全部已与需求方确认）
 
 | 决策项 | 选择 |
 |---|---|
@@ -46,10 +59,16 @@ Minecraft 服务端默认 Anvil (`.mca`) 格式存在三类结构性问题：
 | 容器形态 | 全新容器格式（非 Anvil 外壳改造） |
 | 数据覆盖 | 全部世界持久化数据（region/entities/poi + playerdata/stats/advancements + savedata/地图等），不含服务端配置文件 |
 | 一致性模型 | 原版等价 + 原子记录（epoch 对齐 autosave） |
-| 架构方案 | 混合双层：热层段日志 + 冷层固态归档 |
+| 架构方案 | 混合双层：热层段日志 + 冷层分块固态归档 |
 | 目标基线 | Canvas (Folia) 26.2+ 优先 |
-| 转换行为 | Cesium 式：启动参数触发、原地覆盖转换、原格式文件保留需手动删除 |
+| 默认启用 | **false**（`vault.enabled=false`，显式启用） |
+| 转换行为 | Cesium 式：启动参数/CLI 触发、原地覆盖、**源格式保留需手动删除** |
 | 配置载体 | 世界根目录 `vault.properties`（Java properties 格式） |
+| 内存模型 | 有界：常驻 ~几十 MB + `cache-mb` 可配缓存，与世界大小无关 |
+
+### 存储引擎形态说明
+
+Vault 的热层段日志**就是存储引擎本体**（自带索引/GC/崩溃恢复，等价于专用数据库）。不引入通用嵌入式 KV（LMDB/RocksDB/redb）——通用引擎的 B+ 树 CoW 写放大、单写者事务、冷热混排均不适配 MC chunk 负载（大 blob、空间聚集、region 对齐）。不存在"关闭两层只用数据库"的状态：关引擎即 `vault.enabled=false` 回 Anvil。
 
 ---
 
@@ -62,17 +81,17 @@ graph TB
         SHIM["集成层 Java 插件（RegionStorage SPI hook）"]
         MC --> SHIM
     end
-    subgraph NATIVE["Rust 原生库（.dll/.so，进程内）"]
-        FFI["FFI 边界层（C ABI + catch_unwind）"]
-        HOT["热层：段日志引擎"]
-        COLD["冷层：固态归档引擎"]
-        RECOV["恢复/校验模块"]
+    subgraph NATIVE["Rust 原生库（进程内）"]
+        FFI["FFI 边界（C ABI + catch_unwind）"]
+        HOT["热层：段日志引擎 + 三层索引 + 三档 GC"]
+        COLD["冷层：分块固态归档 .varc"]
+        RECOV["恢复/校验（三级）"]
         FFI --> HOT
         HOT --> COLD
         FFI --> RECOV
     end
     subgraph TOOLING["工具链"]
-        CLI["CLI：双向转换 / 修复 / 统计"]
+        CLI["vault-cli：Cesium 式转换 / verify / compact / stats"]
     end
     SHIM -- "JNI 零拷贝 NBT blob" --> FFI
     CLI --> FFI
@@ -82,32 +101,69 @@ graph TB
 
 | crate | 职责 |
 |---|---|
-| `vault-core` | 容器格式、段引擎、冷归档、索引、恢复——纯 Rust，零 JVM 依赖 |
-| `vault-ffi` | C ABI + JNI 桥，所有跨边界调用 `catch_unwind` 包裹 |
-| `vault-cli` | 离线双向转换器、`verify`、`compact`、`stats` |
-| `vault-plugin-canvas`（Java） | Canvas/Folia 集成：hook chunk IO，Bukkit API 透明 |
-| `vault-plugin-paper` / `-arclight` | 其余 fork 的薄适配 shim（后续） |
+| `vault-core` | 容器格式、段引擎、三层索引、GC、冷归档、恢复——纯 Rust，零 JVM 依赖 |
+| `vault-ffi` | C ABI + JNI 桥，所有跨边界调用 `catch_unwind` 包裹（Phase 2） |
+| `vault-cli` | Cesium 式双向转换器、`verify`、`compact`、`stats`、`vault.properties` 加载器 |
+| `vault-plugin-canvas`（Java） | Canvas/Folia 集成 shim（Phase 2） |
 
 ### 磁盘布局（每 dimension 一个存储池）
 
 ```
 world/dimensions/minecraft/overworld/
 ├─ vstore/
-│  ├─ manifest.vsm            # 格式版本 + epoch + 段表 + 冷归档索引（影子双副本）
-│  ├─ segments/seg-0001.vseg  # 热层追加段（regionizer 分区对齐分片）
-│  ├─ cold/r.X.Z.varc         # 冷层固态归档（region 对齐，1024 chunk/个）
-│  └─ epoch/current.velog     # 当前 autosave 周期日志（崩溃原子性）
-├─ level.dat / data/ ...      # 未纳入部分保持原样
+│  ├─ manifest.vsm (+ .bak)      # 影子双副本：格式版本/epoch/段表/冷索引/region 位图
+│  ├─ segments/seg-0001.vseg     # 热层追加段（regionizer 分区对齐分片）
+│  ├─ segments/seg-0001.vix      # 每段一个磁盘索引页（排序数组 + 前缀压缩）
+│  ├─ cold/r.X.Z.varc            # 冷层分块归档（region 对齐，1024 chunk/个）
+│  ├─ epoch/current.velog        # 当前 autosave 周期日志
+│  ├─ dict/                      # per-type zstd 字典（字典槽 0–15）
+│  └─ .convert-progress          # 转换进度（仅转换期间存在）
+├─ level.dat / data/ ...         # 未纳入部分保持原样
 ```
 
 ### 长期兼容承诺
 
-1. **信封式记录**：记录外壳（坐标/类型/时间戳/hash/压缩ID）与 NBT 负载解耦，Rust 永不解析 NBT 内部 → 未来任意版本 NBT 结构变化自动透传。
+1. **信封式记录**：记录外壳与 NBT 负载解耦，Rust 永不解析 NBT 内部 → 未来任意版本 NBT 结构变化自动透传。
 2. **未知类型透传**：manifest 与信封保留未知 type id，未来新数据类型不破坏旧引擎。
+3. **混存自由**：每条记录自带 codec/字典槽/代际 → 任意时刻改配置，新旧记录共存，读取永远不依赖当前配置。
 
 ---
 
-## 4. 热层段引擎（Segment Log）
+## 4. 内存模型（支持 TB 级存档的核心）
+
+**原则：内存占用取决于活跃区域与配置上界，与世界总大小无关**（与原版 Paper 同性质）。
+
+### 三层索引
+
+```
+┌─ L0 常驻（~几十 MB，与世界大小弱相关）────────────────────┐
+│  段表：每段 ID/文件/桶/打分统计（KB/段）                     │
+│  每段 region 占用位图：128B/region/type                     │
+│    → 未生成 chunk 负查询 O(1) 位操作，零磁盘 IO（MC 领域特化，│
+│      优于任何布隆/学习过滤器：位图精确且 1 bit/槽）           │
+├─ L1 有界缓存（vault.index.cache-mb，默认 512）──────────────┤
+│  热点索引页 —— SIEVE 淘汰（访问只置位、淘汰手扫描，           │
+│  Folia 多线程近乎免锁；NSDI'24 命中率 ≥LRU）                │
+├─ L2 磁盘（无界）─────────────────────────────────────────────┤
+│  每段一个 .vix 索引页文件：排序数组 + 键前缀压缩（SlimDB 式）  │
+│  GC 压实时随段重写；崩溃后按需从信封扫描重建                   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**读路径**：位图判存在（不存在直接返回，零 IO）→ L1 查 → miss 读磁盘索引页（1–2 次 IO，与原版打开 region 读 8KB 头同量级）→ 段文件取记录。
+
+**内存上界测算**：
+
+| 存档规模 | 常驻 | 缓存上界（可配） | 合计上界 |
+|---|---|---|---|
+| 10 GB 小服 | ~5 MB | 512 MB | ~520 MB |
+| 10 TB（2b2t 级，~5 万 region×3 类型） | ~25 MB（位图 19 MB + 段表） | 512 MB | **~540 MB** |
+
+**启动**：只读 manifest + 位图，O(段数) 秒开，**不扫描段文件**；全扫描降级为恢复/`verify` 专用路径。
+
+---
+
+## 5. 热层段引擎
 
 ### 写入路径（Folia 并发安全）
 
@@ -117,128 +173,193 @@ chunk 脏数据 (NBT blob)
    ▼
 按分区哈希 → 选段分片（shard-per-region，无锁追加）
    ▼
-追加到段文件末尾（顺序写，io_uring 可选）
-   │ 同时更新：
-   ├─ 内存索引 (x,z,type) → (segId, offset, len, gen)
-   └─ epoch 日志 current.velog
+压缩（当前热层 codec/级别/字典槽）→ 分配 gen
    ▼
-autosave 时机 → fsync 段 + epoch → 切 epoch（原子）
+追加段尾（顺序写）+ 记 epoch 日志 + 更新内存索引
+   ▼
+autosave 时机 → fsync 段 → manifest.epoch++ 并保存 → epoch rotate（原子）
 ```
 
-**关键点**
-- **按 Folia 分区对齐分片**：每个 regionizer 分区绑定独立段分片，追加互不竞争 → Folia 优先下无锁并发的核心。
-- **代际戳（gen）**：索引条目带单调递增代际号，GC 时旧代自然失效，读路径只认最新代。
-- **epoch 边界 = autosave/flush 时机**：与原版保存节奏一致，崩溃最多丢一个 autosave 周期。
+- **段滚动**：当前段超过 `segment-max-bytes`（默认 64 MiB）滚动新段。
+- **代际戳 gen**：单调递增；读路径只认最新代，GC 时旧代自然失效。
+- **epoch 边界 = autosave/flush 时机**：与原版保存节奏完全一致，崩溃最多丢一个 autosave 周期。
 
-### 生命周期分组（DOGI 启发）
+### 生命周期分桶（DOGI）
 
 | 桶 | 判据 | 放置 |
 |---|---|---|
-| 新生成 | 首次写入、无旧代 | 独立"年轻段"（最先回收） |
-| 活跃 | 近期多次改写 | 混合段 |
-| 稳定 | 长期未改写 | 候选迁移冷层 |
+| Young | 首次写入、无旧代 | 独立年轻段（失效率最高，最先回收） |
+| Active | 近期多次改写 | 混合段 |
+| Stable | 长期未改写（`stable-flushes` 周期） | 冷层晋升候选 |
 
-后台 GC 在 tick 空闲期运行：选失效比例超阈值的段，把存活记录重写到新段（重写即压实），旧段删除。GC 速率按前台写压力自适应节流。
+### 三档 GC（DisCoGC 启发 + ArceKV 打分）
 
----
+按失效分布自动选择，预算（`gc.budget-bytes`）节流，tick 空闲期运行：
 
-## 5. 冷层固态归档（Solid Archive）
+1. **hole-punch 挖洞**：稀疏失效区域直接回收，不搬移数据、零写放大。跨平台：Linux `fallocate(PUNCH_HOLE)` / Windows `FSCTL_SET_ZERO_DATA`（稀疏置零，NTFS 粒度 64KB）→ 最小洞尺寸阈值 64KB，小于阈值不挖。
+2. **整段删除**：段失效比例 ≥95% → 直接删文件。
+3. **压实重写**：打分选受害者 `score = 失效比例 × 段大小 / 段年龄`，预算内选分最高；存活记录原样搬迁（不重压——GC 不做重压缩）。
 
-**触发**：连续 N 个 autosave 周期未改写的 region 对齐块（32×32=1024 chunk），且该 region 所有类型（chunk/entities/poi）均稳定 → 迁移候选。
-
-**迁移**：读取该 region 全部记录 → 相似度聚类排序（RubikFS）→ zstd 字典压缩 → 写只读 `.varc`。
-
-**`.varc` 特性**：只读、无碎片、无 GC、索引紧凑，读路径二分定位。
-
-**冷区回读**：命中冷归档 → 解压回内存 → 按需回填热层（写新记录，旧归档标"部分失效"）。冷归档带失效位图，失效超阈值时重写或降级回热层。回读延迟 zstd 解压 ~50µs/chunk，首读后走热层缓存。
-
-**体积收益**：冷 zstd-9 + 聚类字典 ~40%，热 zstd-3 ~60%，混合整体 45–55%（Anvil ~75%）。
+Meterstick 证实 MC 负载高波动 → GC 默认按前台写压力自适应节流。
 
 ---
 
-## 6. 记录信封、Manifest 与恢复
+## 6. 冷层分块固态归档（.varc）
 
-### 信封（每条记录的自描述外壳，定长 52 字节头 + 负载）
+**触发**：region 对齐块（32×32=1024 chunk）全部类型均 Stable（连续 `stable-flushes` 个周期未改写）→ 晋升候选。
+
+**构建**：提取该 region 全部记录 → **superfeatures sketch 排序**（去重文献的轻量相似度特征：对每条负载计算滚动哈希 min/max 特征值对，按特征排序使相似 chunk 相邻——替代 RubikFS 的重量级相似度图，O(1)/条、不解析负载）→ **按 64 chunk 一块分块压缩**（EROFS pcluster 式：每块独立 zstd，可选 per-type 字典）→ 写只读 `.varc`：头 + 块索引表（块号→文件偏移/解压后范围）+ 槽位索引（坐标+type→块内偏移）。
+
+**冷读**：命中 → 读块索引 → **只解压目标块**（~64 chunk 的压缩块，内存上界 ~1–2 MB）→ 块级解压缓存（SIEVE，共享 cache-mb 预算）→ 返回单条。
+
+**回读回填**：玩家走回冷区 → 冷读透明返回；改写该 chunk → 写热层 + 归档失效位图（`.varc.inv` 旁路文件）+1；失效比例超 `invalid-demote-ratio`（默认 0.25）→ 整归档降级回热层。
+
+**体积**：冷数据 zstd-9 + 字典 + 排序收益 ~40%；热 zstd-3 ~60%；混合整体 45–55%（Anvil ~75%）。
+
+---
+
+## 7. 记录信封（40 字节定长头）
 
 ```
-偏移 0   [ magic 4B = "VSEG" ][ record_ver 2B ][ type_id 2B ]
-偏移 8   [ chunk_x 4B ][ chunk_z 4B ][ dim_hash 4B ]
-偏移 20  [ gen 8B ][ timestamp 8B ]
-偏移 36  [ payload_len 4B ][ comp_id 1B ][ pad 3B ]
-偏移 44  [ xxhash64_payload 8B ]
-偏移 52  [ ... 压缩后的 NBT 负载（payload_len 字节）... ]
+偏移 0   [ magic 4B = "VSEG" ][ record_ver 1B ][ type_id 2B ][ comp_id 1B ]
+偏移 8   [ chunk_x 4B ][ chunk_z 4B ]
+偏移 16  [ gen 8B ][ epoch_ts 4B ]
+偏移 28  [ payload_len 4B ][ xxhash64_payload 8B ]
+偏移 40  [ ... 压缩后的 NBT 负载（payload_len 字节）... ]
 ```
 
-所有整数小端编码。外壳与负载解耦；type_id 保留未知值透传。
+所有整数小端。相对早期 52B 版的瘦身依据（F2FS/RocksDB/SectorFile 文献对照）：
+
+- 删 `dim_hash`（-4B）：存储池按维度分目录，维度在路径中。
+- `timestamp` 8B→4B（`epoch_ts`，u32 epoch 计数，F2FS `cp_ver` 同款）：墙钟时间由索引页承载，不入信封。
+- `comp_id` 1B 双语义：低 4 位 codec（0=NONE 1=ZSTD），高 4 位字典槽（0=无字典，16 槽/维度）。
+- 保留 `magic`：头部全毁时的重同步扫描锚点（SectorFile 32B 头没有，靠它我们的三级恢复第 2 级更强）。
+- 保留 `gen`：最新代语义权威来源。
+- 保留 `xxhash`：逐条校验 + 扫描重建验证（ZFS 式父指针存子校验会破坏单条独立可验证性，不采纳）。
+
+小记录开销对比：poi（~500B 压缩后）元数据占比 52B 时 10.4% → 40B 时 8.0%；chunk（~30KB）<0.15%，忽略。
+
+---
+
+## 8. Manifest、恢复与崩溃一致性
 
 ### Manifest（manifest.vsm，影子双副本）
 
-记录：格式版本、当前 epoch、段表（segId→文件/范围/失效统计）、冷归档索引（region→varc 路径/失效位图）。双副本 + 原子 rename 切换，损坏时取较新且校验通过的副本。
+记录：格式版本、当前 epoch、next_gen/next_seg_id、段表（ID/文件/桶/live/total/打分统计）、冷索引（region→varc/失效计数）、region 占用位图快照。
+
+- 双副本 + 原子 rename 切换；损坏时取较新且校验通过的副本。
+- **不用 RocksDB 式日志 MANIFEST 的理由**：manifest 变更频率低（flush/GC/tier 时），日志式的增量回放收益为零，快照双副本更简单且正确性等同。
 
 ### 恢复（三级）
 
-1. **epoch 回放**：崩溃后读 `current.velog` 重建索引，恢复最近 autosave 之后的数据。
-2. **manifest 校验失败** → 扫段文件信封重建段表（每条信封自带坐标/类型）。
-3. **单条记录 hash 不匹配** → 仅该记录标记损坏并告警，不拖垮整个存档。
+1. **epoch 回放**：崩溃后读 `current.velog` 重建索引——恢复最近 autosave 之后的数据。
+2. **manifest 双副本全坏** → 扫描段文件信封重建段表与索引（每条信封自带坐标/类型/gen，magic 用于重同步定位）——此即"启动不扫段、恢复才扫段"的恢复路径。
+3. **单条记录 hash 不匹配** → 仅该记录标记损坏并告警（索引条目 payload_hash=0），不传播。
+
+`Store::verify` 提供全量体检报告（记录数 + 损坏清单）。
 
 ---
 
-## 7. FFI/JNI 集成与 Folia 兼容
+## 9. 配置（vault.properties）
 
-- **零拷贝**：NBT blob 经 DirectByteBuffer 传递，Rust 侧拿 `&[u8]` 直接压缩。
-- **每个跨边界调用 `catch_unwind`**：Rust panic → Java 异常 + 日志，绝不炸 JVM。
-- 段引擎句柄、索引查询为 `Send` 安全 Rust 结构，FFI 层用 `Arc` 共享。
-- shim 挂在 Moonrise chunk IO 线程之下（regionizer 下游），不触碰 tick 线程模型。
-- 段分片按 regionizer 分区哈希，写入天然无锁。
-- 已核实：Spottedleaf SectorFile 实验开过 Folia 分支，存储层替换在 Folia 可行。
-- 插件透明：Bukkit/Paper API 无感知；外部 `.mca` 工具不可直读新格式，CLI 提供双向转换兜底。
-
----
-
-## 8. 迁移、配置、测试与风险
-
-### 迁移与转换器（Cesium 式行为）
-
-- **触发**：服务端启动参数 `--vaultConvertToVault`（Anvil → Vault）或 `--vaultConvertToAnvil`（Vault → Anvil）；CLI 等价命令 `vault-cli convert --to-vault <world>` / `--to-anvil <world>`。转换在服务正常启动前同步执行，完成后继续启动。
-- **原地覆盖**：转换输出写到同一世界目录的目标存储（`vstore/` 或 `region/` 等），目标已存在则**直接覆盖**（与 Cesium wiki 行为一致）。重复执行同一方向的转换即重新生成目标格式——因此转换期间必须停服，且转换后应移除启动参数，否则下次启动会再次覆盖。
-- **保留原格式**：转换**绝不删除**源格式文件（`region/`、`entities/`、`poi/` 或 `vstore/`），由运维确认无误后**手动删除**。两种格式短暂并存，Vault 加载时以 `vstore/` 为准，Anvil 文件仅作回滚备份。
-- **崩溃安全**：转换按 region 粒度提交（每 region 转换 + fsync 后记入转换进度文件 `vstore/.convert-progress`），中断后重跑只处理未完成 region。
-- Phase 2（服务端 shim）：shim 在启动早期解析这两个参数并调用 `vault-core` 转换入口，行为与 CLI 一致。
-
-### 配置（`vault.properties`，世界根目录）
-
-Java properties 格式（`key=value`，`#` 注释），CLI 与服务端 shim 共用同一加载器：
+世界根目录（与 level.dat 同级），Java properties 格式（`key=value`，`#` 注释）。CLI 与服务端 shim 共用同一加载器。**启动时加载**（不做热重载——存储参数中途切换易生歧义）；缺失文件 → 生成带注释模板 + 全默认。
 
 ```properties
-# vault.properties —— 放在世界根目录（与 level.dat 同级）
-vault.enabled=true
+# 总开关（默认 false——必须显式启用）
+vault.enabled=false
+# 冷层（轴 1：容器分层）
+vault.tiering.enabled=true
+vault.tiering.stable-flushes=30
+vault.tiering.invalid-demote-ratio=0.25
+# 压缩（轴 2：与轴 1 正交）
+vault.compression.hot-enabled=true
+vault.compression.cold-enabled=true
 vault.compression.hot=zstd-3
 vault.compression.cold=zstd-9
 vault.compression.dictionary=true
-vault.tiering.stable-flushes=30
+# 索引内存上界
+vault.index.cache-mb=512
+# GC
 vault.gc.enabled=true
 vault.gc.invalid-threshold=0.6
 vault.gc.budget-bytes=33554432
 ```
 
-- 加载顺序：`vault.properties` 覆盖内置默认值；缺失文件 → 全默认并生成一份带注释的模板。
-- 非法值 → 启动报错并指明行号（不静默回退）。
+**级别范围**：zstd -10 ~ 22（0 非法——"库默认"语义歧义；越界报行号错误）。
+**非法值** → 启动报错并指明 `vault.properties:<行号>: <原因>`，不静默回退。
 
+### 组合合法性矩阵
 
-### 测试策略
+| enabled | tiering | 热压缩 | 冷压缩 | 行为 |
+|---|---|---|---|---|
+| false | * | * | * | 回退 Anvil，忽略其余全部配置 |
+| true | false | off | off | 合法 + WARN（全关退化：纯段日志零压缩，体积≈Anvil none） |
+| true | false | on | * | 纯热模式，冷配置忽略并提示 |
+| true | true | off | on | 合法（热 NONE，晋升时才压） |
+| true | true | on | off | 合法 + WARN（冷不压反而更大） |
 
-- `vault-core` 单元 + property-based fuzz（信封编解码、段追加、GC、恢复）。
-- 崩溃注入：随机在写入/fsync/epoch 切换点 kill，验证恢复。
-- 基准：vs Anvil（体积/读延迟/写延迟/fsync 频率），用真实世界数据集。
+语义要点：
+- **只开热关冷**：退化为纯段日志，GC/索引/恢复照常。
+- **只开冷关热**：架构不可能——冷层只读，写入必须经热层基底；该组合归约到 enabled=false。
+- **准冷模式**：`stable-flushes=1` → 稳定 region 尽快晋升，热层只剩活跃写缓冲。
+- 关闭压缩不损失引擎骨架收益（自愈/原子性/有界内存/GC 照常），只损失体积。
+
+### 配置变更语义
+
+- 压缩级别/codec/字典：**随时可改**，只影响之后的写入；旧记录按自身 comp_id 读取（混存合法）。读取永不回写 → 路过旧区域不触发重压；只有"改动后保存 / 冷层晋升降级 / 显式转换"三条路径用新配置。
+- GC/tiering 参数：运行时调优，影响后续轮次。
+- `enabled=false` 前提：先跑 `--vaultConvertToAnvil` 转回 Anvil，否则加载到旧快照（转换器章节说明）。
+
 ---
 
-## 9. 实施里程碑（供 writing-plans 细化）
+## 10. 迁移与转换器（Cesium 式行为）
 
-1. `vault-core` 信封 + 段引擎 + 内存索引（含 fuzz 测试）
-2. epoch 崩溃恢复 + manifest 双副本
-3. 生命周期 GC
-4. 冷层归档 + 聚类 + 回读回填
-5. `vault-ffi` JNI 桥（零拷贝 + catch_unwind）
-6. `vault-plugin-canvas` Folia 集成 shim
-7. `vault-cli` Cesium 式双向转换（启动参数/CLI 双入口，覆盖式、保留源） + verify/compact + `vault.properties` 配置
-8. 基准测试 + Canvas 实服集成验证
+- **触发**：服务端启动参数 `--vaultConvertToVault` / `--vaultConvertToAnvil`（Phase 2 shim 解析）；CLI 等价命令 `vault-cli convert --to-vault <world>` / `--to-anvil <world>`。转换在启动前同步执行，完成后继续启动。
+- **原地覆盖**：输出写到同一世界目录目标存储；目标已存在**直接覆盖重建**（与 Cesium wiki 一致）。重复执行同方向转换 = 重新生成；转换后应移除启动参数，否则下次启动再次覆盖。
+- **保留源格式**：转换**绝不删除**源（`region/`/`entities/`/`poi/` 或 `vstore/`），运维验证后**手动删除**；结束时打印醒目提示与源目录列表。
+- **可恢复进度**：每 region 完成追加 `vstore/.convert-progress` 一行 + fsync；中断重跑跳过已完成；全部完成后删除进度文件。
+- **全量 + 当前配置**：遍历所有 region/entities/poi `.mca`，按当前 `vault.properties` 压缩级别写 vstore；反向转 Anvil 固定 DEFLATE（Anvil 不支持 zstd）。中断期间改配置会造成混级别（合法但不一致）。
+- Phase 1 CLI 仅支持 overworld 维度；DIM-1 等报"暂不支持"。
+
+---
+
+## 11. FFI/JNI 集成与 Folia 兼容（Phase 2，接口约定）
+
+- **零拷贝**：NBT blob 经 DirectByteBuffer 传递，Rust 侧拿 `&[u8]` 直接压缩。
+- **每个跨边界调用 `catch_unwind`**：Rust panic → Java 异常 + 日志，绝不炸 JVM。
+- shim 挂在 Moonrise chunk IO 线程之下（regionizer 下游），不触碰 tick 线程模型；段分片按 regionizer 分区哈希，写入天然无锁。
+- 已核实：Spottedleaf SectorFile 实验开过 Folia 分支，存储层替换在 Folia 可行。
+- 插件透明：Bukkit/Paper API 无感知；外部 `.mca` 工具不可直读新格式，CLI 双向转换兜底。
+
+---
+
+## 12. 测试策略与风险
+
+### 测试
+
+- `vault-core` 单元 + property-based fuzz（proptest；信封编解码、段追加/扫描、索引、GC、恢复）。
+- 崩溃注入：随机在写入/fsync/epoch 切换点 kill，验证三级恢复。
+- 基准（criterion）：vs Anvil 体积（目标 ≤0.65×）/写吞吐/读延迟 p50·p99；合成世界 4096 chunk。
+- 集成（Phase 2）：Canvas 实服跑图 + 插件兼容性矩阵（Multiverse 等）。
+
+### 风险与缓解
+
+| 风险 | 缓解 |
+|---|---|
+| Rust panic 炸服务器 | catch_unwind 全覆盖 + CI fuzz |
+| 冷区回读延迟抖动 | 分块解压上界 1–2 MB + 块缓存；zstd 解压 ~50µs/chunk |
+| Canvas 26.2 API 漂移 | 集成层薄 shim + 版本探测；core 与 JVM 解耦 |
+| Windows hole-punch 语义差异 | FSCTL_SET_ZERO_DATA 双实现 + 64KB 最小洞阈值；基准覆盖两平台 |
+| 体积收益不达预期 | 字典 + superfeatures 排序已是最优组合；可回退热层级别 |
+| 双格式并存复杂度 | CLI 双向转换 + 源格式保留回滚 + 明确弃用路径 |
+| TB 级内存失控 | 三层索引 + 启动不扫段 + 基准用 10TB 合成负载验证内存曲线平坦 |
+
+---
+
+## 13. 演进路线（明确不做，留给未来）
+
+- 学习索引（Bourbon/CARMI 完整版）：键空间泛化时再评估
+- per-type 之外的多字典策略 / lzma2 冷层 codec（注册表已留扩展位）
+- `vault-cli recompress <world>` 全量重压维护命令
+- Nether/End 维度转换（Phase 1 仅 overworld）
+- playerdata/stats/advancements/savedata 纳入（Phase 1 仅三大件，信封 type_id 已预留）
