@@ -149,7 +149,7 @@ fn superfeatures_ordering_improves_compression() {
         unit.extend_from_slice(&buf);
         unit.extend_from_slice(nbt);
         let mut frame = Vec::new();
-        zstd::stream::copy_encode(&unit, &mut frame, 9).unwrap();
+        zstd::stream::copy_encode(&unit[..], &mut frame, 9).unwrap();
         baseline_bytes += frame.len() as u64;
     }
     assert!(
