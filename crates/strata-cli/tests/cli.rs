@@ -8,7 +8,7 @@ fn synth_anvil_world(world: &std::path::Path) {
         .map(|i| ChunkLoc {
             x: i,
             z: 0,
-            nbt: vec![i as u8; 200],
+            nbt: vec![i; 200],
             timestamp: i as u32,
         })
         .collect();
