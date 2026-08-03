@@ -10,6 +10,7 @@
 //! └─ epoch/current.velog            # EpochLog::open(root/epoch)
 //! ```
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -19,6 +20,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::codec::{codec_for, dict_slot, make_comp_id, CODEC_NONE, CODEC_ZSTD};
+use crate::cold::ArchiveReader;
 use crate::envelope::{Envelope, ENVELOPE_SIZE};
 use crate::epoch::{EpochEntry, EpochLog};
 use crate::gc;
@@ -31,6 +33,8 @@ use crate::StrataError;
 
 /// 段文件子目录。
 pub(crate) const SEGMENTS_DIR: &str = "segments";
+/// 冷归档子目录。
+pub(crate) const COLD_DIR: &str = "cold";
 /// epoch 日志子目录。
 pub(crate) const EPOCH_DIR: &str = "epoch";
 
@@ -42,6 +46,11 @@ pub(crate) fn seg_path(root: &Path, seg_id: u32) -> PathBuf {
 /// 段磁盘索引页路径：`segments/seg-XXXX.vix`。
 pub(crate) fn ix_path(root: &Path, seg_id: u32) -> PathBuf {
     root.join(SEGMENTS_DIR).join(format!("seg-{seg_id:04}.vix"))
+}
+
+/// 冷归档文件路径：`cold/r.{rx}.{rz}.varc`。
+pub(crate) fn cold_path(root: &Path, region_x: i32, region_z: i32) -> PathBuf {
+    root.join(COLD_DIR).join(format!("r.{region_x}.{region_z}.varc"))
 }
 
 /// Store 配置。
@@ -117,6 +126,8 @@ pub struct Store {
     pub(crate) active_seg: u32,
     /// open 以来的 flush 次数（分桶晋升用）。
     pub(crate) epoch_flush_count: u64,
+    /// 冷归档懒加载读取器（`read`/`write` 命中冷区时按需打开）。
+    pub(crate) cold_readers: RefCell<HashMap<RegionKey, ArchiveReader>>,
 }
 
 /// 空 manifest（新 store 或 manifest 损坏重建时用）。
@@ -125,6 +136,14 @@ fn empty_manifest() -> Manifest {
         format_version: FORMAT_VERSION,
         next_seg_id: 1,
         ..Manifest::default()
+    }
+}
+
+/// `cold_readers` 哈希键（manifest 的 `RegionKey` 未派生 `Hash`，此处补本地实现）。
+impl std::hash::Hash for RegionKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.x.hash(state);
+        self.z.hash(state);
     }
 }
 
@@ -157,6 +176,7 @@ impl Store {
             writer: None,
             active_seg: 0,
             epoch_flush_count: 0,
+            cold_readers: RefCell::new(HashMap::new()),
         };
 
         if needs_rebuild {
@@ -178,7 +198,20 @@ impl Store {
         }
 
         // epoch 回放：日志里的记录可能比 .vix 新（崩溃前未 flush）。
+        // 已晋升冷区的键不得被回放复活（否则热层重新索引到已搬走的数据）。
         for e in store.epoch.replay()? {
+            let rk = RegionKey {
+                x: e.env.chunk_x >> 5,
+                z: e.env.chunk_z >> 5,
+            };
+            if store
+                .manifest
+                .cold
+                .iter()
+                .any(|c| c.region_x == rk.x && c.region_z == rk.z)
+            {
+                continue;
+            }
             if let Some(st) = store.segs.get_mut(&e.seg_id) {
                 let key = IndexKey {
                     x: e.env.chunk_x,
@@ -304,6 +337,10 @@ impl Store {
             w.fsync()?;
             w.close()?;
         }
+
+        // 10. 冷区失效：覆盖已晋升 region 的键时，归档槽位作废并记账。
+        self.invalidate_cold_slot(x, z, type_id)?;
+
         Ok(())
     }
 
@@ -342,7 +379,28 @@ impl Store {
 
         let val = match best {
             Some(v) => v,
-            None => return Ok(None),
+            None => {
+                // 热路径全 miss：回落到冷归档（懒加载 reader）。
+                let rk = RegionKey {
+                    x: x >> 5,
+                    z: z >> 5,
+                };
+                if self
+                    .manifest
+                    .cold
+                    .iter()
+                    .any(|c| c.region_x == rk.x && c.region_z == rk.z)
+                {
+                    let path = cold_path(&self.root, rk.x, rk.z);
+                    let mut readers = self.cold_readers.borrow_mut();
+                    if !readers.contains_key(&rk) {
+                        readers.insert(rk.clone(), ArchiveReader::open(&path)?);
+                    }
+                    let reader = readers.get_mut(&rk).expect("inserted above");
+                    return reader.get(x, z, type_id);
+                }
+                return Ok(None);
+            }
         };
 
         // 读盘：信封头 → 字段校验 → 负载 → 哈希校验。
@@ -585,6 +643,49 @@ impl Store {
         for (_, v) in &latest {
             if let Some(m) = self.manifest.segments.iter_mut().find(|m| m.id == v.seg_id) {
                 m.live_bytes += ENVELOPE_SIZE as u64 + v.payload_len as u64;
+            }
+        }
+        Ok(())
+    }
+
+    /// 若 `(x, z, type_id)` 所在 region 已有冷归档，失效其槽位并在 manifest 记账。
+    ///
+    /// `write` 收尾调用：热层新写覆盖冷槽后，冷副本不再是最新版本。
+    pub(crate) fn invalidate_cold_slot(
+        &mut self,
+        x: i32,
+        z: i32,
+        type_id: u16,
+    ) -> Result<(), StrataError> {
+        let rk = RegionKey {
+            x: x >> 5,
+            z: z >> 5,
+        };
+        if !self
+            .manifest
+            .cold
+            .iter()
+            .any(|c| c.region_x == rk.x && c.region_z == rk.z)
+        {
+            return Ok(());
+        }
+        let path = cold_path(&self.root, rk.x, rk.z);
+        let first = {
+            let mut readers = self.cold_readers.borrow_mut();
+            if !readers.contains_key(&rk) {
+                readers.insert(rk.clone(), ArchiveReader::open(&path)?);
+            }
+            let reader = readers.get_mut(&rk).expect("inserted above");
+            reader.invalidate(x, z, type_id)?
+        };
+        if first {
+            if let Some(c) = self
+                .manifest
+                .cold
+                .iter_mut()
+                .find(|c| c.region_x == rk.x && c.region_z == rk.z)
+            {
+                c.invalid_count += 1;
             }
         }
         Ok(())
