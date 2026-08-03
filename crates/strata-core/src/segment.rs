@@ -205,7 +205,7 @@ pub fn scan_segment(path: &Path) -> Result<ScanResult, StrataError> {
             };
 
         let total = ENVELOPE_SIZE as u64 + env.payload_len as u64;
-        if (data.len() - pos) as u64 < total {
+        if ((data.len() - pos) as u64) < total {
             // 尾部负载不足 → 崩溃截断，容忍。
             result.truncated_tail = true;
             break;

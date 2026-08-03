@@ -124,8 +124,16 @@ impl ArchiveBuilder {
 
     /// Sort by superfeatures, chunk, compress, and write the archive to `path`.
     pub fn finish(self, path: &Path) -> Result<ArchiveSummary, StrataError> {
-        let mut keyed: Vec<BuildEntry> = Vec::with_capacity(self.items.len());
-        for item in self.items.into_iter().flatten() {
+        let Self {
+            region_x,
+            region_z,
+            level,
+            dict,
+            items,
+            by_key: _,
+        } = self;
+        let mut keyed: Vec<BuildEntry> = Vec::with_capacity(items.len());
+        for item in items.into_iter().flatten() {
             let (env, nbt) = item;
             let (min_h, max_h) = superfeatures(&nbt);
             keyed.push(BuildEntry {
@@ -172,7 +180,7 @@ impl ArchiveBuilder {
                 plain.extend_from_slice(&buf);
                 plain.extend_from_slice(&e.nbt);
             }
-            let comp = self.compress_block(&plain)?;
+            let comp = Self::compress_block(&dict, level, &plain)?;
             let block_id = u16::try_from(block_outs.len())
                 .map_err(|_| StrataError::Codec("cold archive exceeds 65536 blocks".into()))?;
             let mut offset_in_block = ENVELOPE_SIZE as u32;
@@ -211,8 +219,8 @@ impl ArchiveBuilder {
 
         let mut out = Vec::with_capacity((data_start) as usize);
         out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&self.region_x.to_le_bytes());
-        out.extend_from_slice(&self.region_z.to_le_bytes());
+        out.extend_from_slice(&region_x.to_le_bytes());
+        out.extend_from_slice(&region_z.to_le_bytes());
         out.extend_from_slice(&(block_outs.len() as u32).to_le_bytes());
         out.extend_from_slice(&(slots.len() as u32).to_le_bytes());
         for (b, offset) in block_outs.iter().zip(&offsets) {
@@ -247,15 +255,15 @@ impl ArchiveBuilder {
         })
     }
 
-    fn compress_block(&self, data: &[u8]) -> Result<Vec<u8>, StrataError> {
+    fn compress_block(dict: &Option<Vec<u8>>, level: i32, data: &[u8]) -> Result<Vec<u8>, StrataError> {
         let mut out = Vec::new();
-        let res = match &self.dict {
-            None => zstd::stream::copy_encode(data, &mut out, self.level),
+        let res = match dict {
+            None => zstd::stream::copy_encode(data, &mut out, level),
             // Phase 1: the dictionary is not stored in the archive, so blocks
             // written through this path cannot be read back by ArchiveReader
             // until caller-supplied dictionary plumbing lands.
             Some(dict) => {
-                let prepared = zstd::dict::EncoderDictionary::copy(dict, self.level);
+                let prepared = zstd::dict::EncoderDictionary::copy(dict, level);
                 let mut enc =
                     zstd::stream::write::Encoder::with_prepared_dictionary(&mut out, &prepared)?;
                 enc.write_all(data)?;
