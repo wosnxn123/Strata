@@ -48,6 +48,8 @@ Minecraft 服务端默认 Anvil (`.mca`) 格式存在三类结构性问题：
 | 一致性模型 | 原版等价 + 原子记录（epoch 对齐 autosave） |
 | 架构方案 | 混合双层：热层段日志 + 冷层固态归档 |
 | 目标基线 | Canvas (Folia) 26.2+ 优先 |
+| 转换行为 | Cesium 式：启动参数触发、原地覆盖转换、原格式文件保留需手动删除 |
+| 配置载体 | 世界根目录 `vault.properties`（Java properties 格式） |
 
 ---
 
@@ -195,27 +197,33 @@ autosave 时机 → fsync 段 + epoch → 切 epoch（原子）
 
 ## 8. 迁移、配置、测试与风险
 
-### 迁移与转换器（vault-cli）
+### 迁移与转换器（Cesium 式行为）
 
-- `vault-cli import <world>`：mca/entities/poi → vstore（不删原文件）。
-- `vault-cli export <world>`：反向回滚/供外部工具。
-- 服务端首启检测旧格式 → 提示 + 可选在线渐进迁移（region 粒度后台跑）。
+- **触发**：服务端启动参数 `--vaultConvertToVault`（Anvil → Vault）或 `--vaultConvertToAnvil`（Vault → Anvil）；CLI 等价命令 `vault-cli convert --to-vault <world>` / `--to-anvil <world>`。转换在服务正常启动前同步执行，完成后继续启动。
+- **原地覆盖**：转换输出写到同一世界目录的目标存储（`vstore/` 或 `region/` 等），目标已存在则**直接覆盖**（与 Cesium wiki 行为一致）。重复执行同一方向的转换即重新生成目标格式——因此转换期间必须停服，且转换后应移除启动参数，否则下次启动会再次覆盖。
+- **保留原格式**：转换**绝不删除**源格式文件（`region/`、`entities/`、`poi/` 或 `vstore/`），由运维确认无误后**手动删除**。两种格式短暂并存，Vault 加载时以 `vstore/` 为准，Anvil 文件仅作回滚备份。
+- **崩溃安全**：转换按 region 粒度提交（每 region 转换 + fsync 后记入转换进度文件 `vstore/.convert-progress`），中断后重跑只处理未完成 region。
+- Phase 2（服务端 shim）：shim 在启动早期解析这两个参数并调用 `vault-core` 转换入口，行为与 CLI 一致。
 
-### 配置（paper-world.yml 风格）
+### 配置（`vault.properties`，世界根目录）
 
-```yaml
-vault:
-  enabled: true
-  compression:
-    hot: zstd-3
-    cold: zstd-9
-    dictionary: true
-  tiering:
-    stable-cycles: 1200
-  gc:
-    enabled: true
-    invalid-threshold: 0.6
+Java properties 格式（`key=value`，`#` 注释），CLI 与服务端 shim 共用同一加载器：
+
+```properties
+# vault.properties —— 放在世界根目录（与 level.dat 同级）
+vault.enabled=true
+vault.compression.hot=zstd-3
+vault.compression.cold=zstd-9
+vault.compression.dictionary=true
+vault.tiering.stable-flushes=30
+vault.gc.enabled=true
+vault.gc.invalid-threshold=0.6
+vault.gc.budget-bytes=33554432
 ```
+
+- 加载顺序：`vault.properties` 覆盖内置默认值；缺失文件 → 全默认并生成一份带注释的模板。
+- 非法值 → 启动报错并指明行号（不静默回退）。
+
 
 ### 测试策略
 
@@ -232,5 +240,5 @@ vault:
 4. 冷层归档 + 聚类 + 回读回填
 5. `vault-ffi` JNI 桥（零拷贝 + catch_unwind）
 6. `vault-plugin-canvas` Folia 集成 shim
-7. `vault-cli` 双向转换 + verify/compact
+7. `vault-cli` Cesium 式双向转换（启动参数/CLI 双入口，覆盖式、保留源） + verify/compact + `vault.properties` 配置
 8. 基准测试 + Canvas 实服集成验证

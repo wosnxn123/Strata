@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 实现 Vault 存储引擎的纯 Rust 核心（`vault-core`）与离线工具（`vault-cli`）：信封格式、段日志引擎、内存索引、epoch 崩溃恢复、影子双副本 manifest、生命周期 GC、冷层固态归档、Anvil 双向转换器——全部独立于 JVM，可测试、可基准。
+**Goal:** 实现 Vault 存储引擎的纯 Rust 核心（`vault-core`）与离线工具（`vault-cli`）：信封格式、段日志引擎、内存索引、epoch 崩溃恢复、影子双副本 manifest、生命周期 GC、冷层固态归档、Cesium 式双向格式转换（原地覆盖、保留源格式）、`vault.properties` 配置——全部独立于 JVM，可测试、可基准。
 
 **Architecture:** 每 dimension 一个存储池：追加式段文件（regionizer 分区分片）+ 最新代内存索引 + epoch 日志（对齐 autosave 原子性）+ 影子双副本 manifest；稳定 region 迁移为只读 `.varc` 冷归档（聚类 + zstd）。Rust 永不解析 NBT 负载。
 
@@ -15,6 +15,8 @@
 - `type_id` 未知值必须原样透传（长期兼容承诺 2）。
 - 崩溃一致性 = 原版等价：最多丢一个未 fsync 的 epoch 周期；epoch 边界由调用方 `flush()` 触发。
 - 每条记录带 `xxhash64(压缩负载)`，单条损坏只隔离该记录，不传播。
+- 转换**绝不删除源格式文件**；重复执行同方向转换直接覆盖目标格式（Cesium wiki 行为）；源格式由运维验证后手动删除。
+- 配置载体为世界根目录 `vault.properties`（Java properties 格式）；非法值报错并指明行号，不静默回退。
 - 测试全部可在 Windows stable Rust 上运行（不依赖 cargo-fuzz/nightly；属性测试用 proptest）。
 - 每个任务结束必须 commit；测试先行（TDD）。
 - 目标平台：`x86_64-pc-windows-msvc` 与 `x86_64-unknown-linux-gnu`。
@@ -42,10 +44,9 @@ crates/vault-core/
 crates/vault-cli/
   src/main.rs                   # clap 子命令
   src/anvil.rs                  # Anvil .mca/.mcc 读写
+  src/config.rs                 # vault.properties 加载器（CLI 与未来 shim 共用）
 benches/vs_anvil.rs             # criterion 基准
 ```
-
----
 
 ### Task 1: Workspace 脚手架
 
@@ -1274,67 +1275,195 @@ git add crates/vault-cli && git commit -m "feat(cli): anvil .mca reader/writer"
 
 ---
 
-### Task 15: vault-cli 命令（import/export/verify/compact/stats）
+### Task 15: vault.properties 配置加载器
 
 **Files:**
-- Modify: `crates/vault-cli/src/main.rs`
-- Test: `crates/vault-cli/tests/cli.rs`
+- Create: `crates/vault-cli/src/config.rs`
+- Test: 内嵌 `#[cfg(test)]`
 
 **Interfaces:**
-- Consumes: vault-core `Store`、anvil 模块
-- Produces: 子命令：
-  - `vault-cli import <world> --dim overworld` — 读 `region/*.mca`+`entities/*.mca`+`poi/*.mca` → `Store::write`（type_id: 0=chunk 1=entities 2=poi）→ flush → 打印体积对比
-  - `vault-cli export <world> --dim overworld` — 反向，按 region 聚合后 `write_region`
-  - `vault-cli verify <vstore>` — `Store::open` + `verify()` 打印报告
-  - `vault-cli compact <vstore>` — `gc_pass` + `tier_pass` 直到收敛
-  - `vault-cli stats <vstore>` — 段数/冷归档数/活字节/总字节/压缩估算
+- Consumes: vault-core `StoreConfig`、`GcConfig`、`TierConfig`
+- Produces:
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct VaultConfig {
+    pub enabled: bool,                // vault.enabled，默认 true
+    pub store: StoreConfig,           // vault.compression.hot（"zstd-<level>"）
+    pub gc: GcConfig,                 // vault.gc.*
+    pub tier: TierConfig,             // vault.tiering.*
+    pub dictionary: bool,             // vault.compression.dictionary，默认 true（Phase 2 生效）
+    pub cold_level: i32,              // vault.compression.cold，默认 9
+}
+impl Default for VaultConfig { /* 全默认值 */ }
+pub fn load_or_create_template(world_root: &Path) -> anyhow::Result<VaultConfig>;
+// 无文件 → 写带注释的默认模板 vault.properties 并返回默认配置
+// 有文件 → 解析；未知 key 告警忽略；非法值 → Err 带 "vault.properties:<行号>: <原因>"
+pub fn parse_properties(text: &str) -> anyhow::Result<std::collections::HashMap<String, String>>;
+// '#'/'!' 开头整行注释；key=value 首个 '=' 分割；key/value trim；支持行尾 '\' 续行
+```
+模板内容（写入时用）：
+```properties
+# Vault storage configuration
+vault.enabled=true
+vault.compression.hot=zstd-3
+vault.compression.cold=zstd-9
+vault.compression.dictionary=true
+vault.tiering.stable-flushes=30
+vault.gc.enabled=true
+vault.gc.invalid-threshold=0.6
+vault.gc.budget-bytes=33554432
+```
 
-- [ ] **Step 1: 写失败测试** `tests/cli.rs`（用 `assert_cmd` 或进程内调用封装函数）
+- [ ] **Step 1: 写失败测试**
 
 ```rust
 #[test]
-fn import_export_roundtrip_preserves_chunks() {
+fn missing_file_creates_template_with_defaults() {
     let dir = tempfile::tempdir().unwrap();
-    let world = dir.path();
-    std::fs::create_dir_all(world.join("region")).unwrap();
-    let chunks: Vec<_> = (0..10).map(|i| ChunkLoc { x: i, z: 0, nbt: vec![i as u8; 200], timestamp: i as u32 }).collect();
-    crate::anvil::write_region(&world.join("region/r.0.0.mca"), &chunks).unwrap();
+    let cfg = load_or_create_template(dir.path()).unwrap();
+    assert_eq!(cfg, VaultConfig::default());
+    let text = std::fs::read_to_string(dir.path().join("vault.properties")).unwrap();
+    assert!(text.contains("vault.compression.hot=zstd-3"));
+}
 
-    // import → export 到另一个目录 → 逐条比对
-    vault_cli::run(&["import", world.to_str().unwrap()]).unwrap();
-    let out = dir.path().join("exported");
-    vault_cli::run(&["export", world.to_str().unwrap(), "-o", out.to_str().unwrap()]).unwrap();
-    let back = crate::anvil::read_region(&out.join("region/r.0.0.mca")).unwrap();
-    assert_eq!(back.len(), 10);
-    assert_eq!(back[3].nbt, vec![3u8; 200]);
+#[test]
+fn overrides_and_comments_and_continuation() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("vault.properties"),
+        "# comment\nvault.enabled=true\nvault.compression.hot=zstd-9\n\\\n").unwrap();
+    let cfg = load_or_create_template(dir.path()).unwrap();
+    assert_eq!(cfg.store.zstd_level, 9);
+}
+
+#[test]
+fn invalid_value_reports_line_number() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("vault.properties"),
+        "vault.enabled=true\nvault.gc.invalid-threshold=notanumber\n").unwrap();
+    let err = load_or_create_template(dir.path()).unwrap_err().to_string();
+    assert!(err.contains(":2:"));
 }
 ```
-（需要把 `main` 逻辑抽为 `vault_cli::run(&[&str]) -> anyhow::Result<()>` 以便测试。）
 
-- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-cli`
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-cli config`
 
-- [ ] **Step 3: 实现**（clap derive；import 遍历维度目录三类文件；entities/poi 的 chunk 坐标来自文件名与内部头坐标一致校验；export 按 `region = chunk >> 5` 分组）
+- [ ] **Step 3: 实现 `config.rs`**（解析器约 60 行；映射层把每个 key 转成对应字段，解析失败用行号构造错误）
+
+- [ ] **Step 4: 运行确认通过** — Run: `cargo test -p vault-cli config`，Expected: 3 PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/vault-cli && git commit -m "feat(cli): vault.properties config loader"
+```
+
+---
+
+### Task 16: vault-cli 命令（Cesium 式转换/verify/compact/stats）
+
+**Files:**
+- Modify: `crates/vault-cli/src/main.rs`
+- Create: `crates/vault-cli/tests/cli.rs`
+
+**Interfaces:**
+- Consumes: vault-core `Store`、anvil 模块（Task 14）、config（Task 15）
+- Produces: 子命令：
+  - `vault-cli convert --to-vault <world>` — **Cesium 式**：读 `region/`+`entities/`+`poi/` 全部 `.mca` → 写入同目录 `vstore/`（已存在则**整体覆盖重建**）→ flush → 打印体积对比与"源文件已保留，请验证后手动删除"提示
+  - `vault-cli convert --to-anvil <world>` — 反向：`vstore/` → 覆盖写 `region/`+`entities/`+`poi/`，`vstore/` 保留
+  - `vault-cli verify <world>` — `Store::open` + `verify()` 打印报告
+  - `vault-cli compact <world>` — `gc_pass` + `tier_pass` 直到收敛
+  - `vault-cli stats <world>` — 段数/冷归档数/活字节/总字节/压缩估算
+- 行为契约（两个方向通用）：
+  - **覆盖语义**：`--to-vault` 开始时若 `vstore/` 存在则整体删除后重建；`--to-anvil` 逐个 `.mca` 覆盖写（临时文件 + rename）。
+  - **绝不删除源格式**（`region/` 等 或 `vstore/`）；结束时打印：`转换完成。源格式文件已保留：<目录列表>。请验证无误后手动删除。`
+  - **可恢复进度**：每转换完一个 region 文件，向 `vstore/.convert-progress` 追加一行（`dim:type:rXZ`）+ fsync；开始时跳过已完成条目；全部完成后删除该文件。
+  - 配置经 `load_or_create_template` 从 `<world>/vault.properties` 读取。
+
+- [ ] **Step 1: 写失败测试** `tests/cli.rs`
+
+```rust
+use vault_cli::anvil::{read_region, write_region, ChunkLoc};
+
+fn synth_anvil_world(world: &std::path::Path) {
+    for dir in ["region", "entities", "poi"] { std::fs::create_dir_all(world.join(dir)).unwrap(); }
+    let chunks: Vec<_> = (0..10).map(|i| ChunkLoc { x: i, z: 0, nbt: vec![i as u8; 200], timestamp: i as u32 }).collect();
+    write_region(&world.join("region/r.0.0.mca"), &chunks).unwrap();
+    write_region(&world.join("entities/r.0.0.mca"), &chunks[..3]).unwrap();
+    write_region(&world.join("poi/r.0.0.mca"), &chunks[..2]).unwrap();
+}
+
+#[test]
+fn convert_to_vault_preserves_anvil_and_overwrites() {
+    let dir = tempfile::tempdir().unwrap();
+    synth_anvil_world(dir.path());
+    vault_cli::run(&["convert", "--to-vault", dir.path().to_str().unwrap()]).unwrap();
+    // 1) 源 Anvil 文件仍在（绝不删除）
+    assert!(dir.path().join("region/r.0.0.mca").exists());
+    // 2) vstore 生成且进度文件已清理
+    assert!(dir.path().join("vstore/manifest.vsm").exists());
+    assert!(!dir.path().join("vstore/.convert-progress").exists());
+    // 3) 重复执行 = 覆盖重建，不报错
+    vault_cli::run(&["convert", "--to-vault", dir.path().to_str().unwrap()]).unwrap();
+    assert!(dir.path().join("region/r.0.0.mca").exists());
+}
+
+#[test]
+fn convert_roundtrip_preserves_all_types() {
+    let dir = tempfile::tempdir().unwrap();
+    synth_anvil_world(dir.path());
+    vault_cli::run(&["convert", "--to-vault", dir.path().to_str().unwrap()]).unwrap();
+    // 覆盖掉 region/ 原文件，证明回读来自 vstore 而非残留
+    std::fs::remove_dir_all(dir.path().join("region")).unwrap();
+    vault_cli::run(&["convert", "--to-anvil", dir.path().to_str().unwrap()]).unwrap();
+    let back = read_region(&dir.path().join("region/r.0.0.mca")).unwrap();
+    assert_eq!(back.len(), 10);
+    assert_eq!(back[3].nbt, vec![3u8; 200]);
+    assert!(dir.path().join("entities/r.0.0.mca").exists());
+    assert!(dir.path().join("vstore/manifest.vsm").exists()); // 源 vstore 保留
+}
+
+#[test]
+fn interrupted_conversion_resumes_without_redo() {
+    let dir = tempfile::tempdir().unwrap();
+    synth_anvil_world(dir.path());
+    // 预置进度文件，声称 region chunk 已完成
+    std::fs::create_dir_all(dir.path().join("vstore")).unwrap();
+    std::fs::write(dir.path().join("vstore/.convert-progress"), "overworld:chunk:r0.0\n").unwrap();
+    vault_cli::run(&["convert", "--to-vault", dir.path().to_str().unwrap()]).unwrap();
+    // entities/poi 仍被转换，进度文件最终清理
+    assert!(!dir.path().join("vstore/.convert-progress").exists());
+}
+```
+（`main` 逻辑抽为 `vault_cli::run(&[&str]) -> anyhow::Result<()>` 以便测试；`anvil` 模块需 `pub`。）
+
+- [ ] **Step 2: 确认失败** — Run: `cargo test -p vault-cli --test cli`
+
+- [ ] **Step 3: 实现**
+- `--to-vault`：`Store::open`（覆盖前先 `remove_dir_all(vstore)` 若存在）→ 遍历三目录 `.mca` → 跳过进度文件已含条目 → `read_region` → 逐条 `Store::write`（type_id: 0=chunk 1=entities 2=poi，维度 dim_hash 由目录层级决定：overworld=0，其余维度 Phase 1 仅 overworld，遇到 `DIM-1` 等报"暂不支持"）→ 每 region 完成追加进度行 → 全部完成 `flush` + 删进度文件。
+- `--to-anvil`：`Store::open` 只读遍历 → 按 `(type, region_x, region_z)` 聚合 → `write_region` 到 `region|entities|poi/r.X.Z.mca`（写临时文件后 rename 覆盖）。
+- verify/compact/stats 按 Interfaces 直调 Store API。
 
 - [ ] **Step 4: 运行确认通过** — Run: `cargo test`，Expected: 全部 PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/vault-cli && git commit -m "feat(cli): import/export/verify/compact/stats commands"
+git add crates/vault-cli && git commit -m "feat(cli): Cesium-style in-place conversion preserving source format"
 ```
 
 ---
 
-### Task 16: 基准（vs Anvil）
+### Task 17: 基准（vs Anvil）
 
 **Files:**
 - Create: `crates/vault-cli/benches/vs_anvil.rs`
+- Create: `benches/RESULTS.md`
 - Test: 基准本身即验证
 
 **Interfaces:**
 - Consumes: 全部
 - Produces: criterion 基准报告：
-  1. **体积**：合成世界（1024 chunk，随机 NBT 200–800B，含重复模式）→ Anvil write vs Vault import+compact → 字节对比
+  1. **体积**：合成世界（4096 chunk，随机 NBT 200–800B，含重复模式）→ Anvil 字节 vs `convert --to-vault` + `compact` 后的 `vstore/` 字节
   2. **写吞吐**：10k 次随机 write+flush 的耗时
   3. **读延迟**：1k 次随机 read（含冷读）p50/p99
 
@@ -1349,7 +1478,7 @@ fn bench_footprint(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     synth_world(dir.path(), 4); // 4 region = 4096 chunk
     let anvil_bytes = dir_size(&dir.path().join("region"));
-    vault_cli::run(&["import", dir.path().to_str().unwrap()]).unwrap();
+    vault_cli::run(&["convert", "--to-vault", dir.path().to_str().unwrap()]).unwrap();
     vault_cli::run(&["compact", dir.path().to_str().unwrap()]).unwrap();
     let vault_bytes = dir_size(&dir.path().join("vstore"));
     println!("anvil={anvil_bytes} vault={vault_bytes} ratio={:.2}", vault_bytes as f64 / anvil_bytes as f64);
@@ -1377,6 +1506,6 @@ git add crates/vault-cli/benches benches/RESULTS.md && git commit -m "bench: vau
 
 ## Self-Review 记录
 
-1. **规格覆盖**：信封（§6）→ Task 2；压缩（§1）→ Task 3；段引擎写/读（§4）→ Tasks 4/5；索引（§4）→ Task 6；epoch 崩溃一致性（§2/§6）→ Tasks 7/9；manifest 双副本（§6）→ Task 8；Store 门面（§4）→ Task 9；三级恢复（§6）→ Tasks 9/10；生命周期 GC（§4）→ Task 11；冷归档+聚类压缩（§5）→ Task 12；冷热迁移/回读回填（§5）→ Task 13；CLI 双向转换（§8）→ Tasks 14/15；基准（§8）→ Task 16。Folia 分区分片写路径与 JNI/Canvas shim 属 Phase 2（规格 §7），本计划明确不覆盖。
+1. **规格覆盖**：信封（§6）→ Task 2；压缩（§1）→ Task 3；段引擎写/读（§4）→ Tasks 4/5；索引（§4）→ Task 6；epoch 崩溃一致性（§2/§6）→ Tasks 7/9；manifest 双副本（§6）→ Task 8；Store 门面（§4）→ Task 9；三级恢复（§6）→ Tasks 9/10；生命周期 GC（§4）→ Task 11；冷归档+聚类压缩（§5）→ Task 12；冷热迁移/回读回填（§5）→ Task 13；`vault.properties` 配置（§8）→ Task 15；Cesium 式双向转换（覆盖式、保留源、进度恢复）（§8）→ Tasks 14/16；基准（§8）→ Task 17。Folia 分区分片写路径、JNI/Canvas shim 与服务端 `--vaultConvertTo*` 启动参数属 Phase 2（规格 §7），本计划明确不覆盖。
 2. **占位符扫描**：无 TBD/TODO；每个代码步骤给出可运行代码或明确算法契约。Task 13 的第二个测试给出了构造说明而非完整代码——已给出断言要点与构造步骤，可接受度边界内。
 3. **类型一致性**：`Envelope` 字段、`IndexKey/IndexVal`、`SegmentWriter::append` 签名、`codec_for(id, zstd_level)` 双参签名、`Store::{write,read,flush,gc_pass,tier_pass,verify}` 在各任务间一致。
