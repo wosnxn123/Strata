@@ -47,16 +47,7 @@ pub struct StrataConfig {
     pub gc: GcConfig,
 }
 
-impl Default for StrataConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            tier: TierConfig::default(),
-            store: StoreConfig::default(),
-            gc: GcConfig::default(),
-        }
-    }
-}
+#[derive(Default)]
 
 // TierConfig/StoreConfig/GcConfig 只派生 Debug+Clone，这里按公开字段逐一比较。
 impl PartialEq for StrataConfig {
@@ -220,8 +211,10 @@ fn parse(text: &str) -> Result<StrataConfig, StrataError> {
         return Ok(StrataConfig::default());
     }
 
-    let mut cfg = StrataConfig::default();
-    cfg.enabled = enabled_explicit.unwrap_or(false);
+    let mut cfg = StrataConfig {
+        enabled: enabled_explicit.unwrap_or(false),
+        ..StrataConfig::default()
+    };
 
     for &(line, ref body) in &logical {
         let Some((key, value)) = split_kv(body) else {

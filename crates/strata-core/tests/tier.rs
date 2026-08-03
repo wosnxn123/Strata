@@ -20,7 +20,7 @@ fn fill_region(store: &mut Store) {
     for x in 0..32i32 {
         for z in 0..2i32 {
             store
-                .write(x, z, 0, &vec![(x + z * 32) as u8; 64])
+                .write(x, z, 0, &[(x + z * 32) as u8; 64])
                 .unwrap();
         }
     }
@@ -62,7 +62,7 @@ fn heavy_invalidation_demotes_archive() {
 
     // 改写 region 内 >25% 的 chunk（17/64 = 0.2656 > 0.25）。
     for x in 0..17i32 {
-        s.write(x, 0, 0, &vec![200u8; 32]).unwrap();
+        s.write(x, 0, 0, &[200u8; 32]).unwrap();
     }
 
     let stats = s.tier_pass(&tier()).unwrap();

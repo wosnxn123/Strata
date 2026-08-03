@@ -15,10 +15,10 @@ fn gc_compacts_dead_records_and_preserves_live() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Store::open(dir.path(), small_cfg()).unwrap();
     for i in 0..20i32 {
-        s.write(i, 0, 0, &vec![i as u8; 100]).unwrap();
+        s.write(i, 0, 0, &[i as u8; 100]).unwrap();
     }
     for i in 0..18i32 {
-        s.write(i, 0, 0, &vec![i as u8; 50]).unwrap();
+        s.write(i, 0, 0, &[i as u8; 50]).unwrap();
     }
     s.flush().unwrap();
     let (live_before, total_before) = s.touch_stats();
@@ -93,15 +93,15 @@ fn nearly_dead_segment_fully_removed() {
     };
     let mut s = Store::open(dir.path(), cfg).unwrap();
     for i in 0..20i32 {
-        s.write(i, 0, 0, &vec![i as u8; 180]).unwrap();
+        s.write(i, 0, 0, &[i as u8; 180]).unwrap();
     }
     s.flush().unwrap();
     // 覆盖 keys 0..=18 → seg-0001 内记录 100% 失效（key 19 在 seg-0002）。
     for i in 0..19i32 {
-        s.write(i, 0, 0, &vec![i as u8; 180]).unwrap();
+        s.write(i, 0, 0, &[i as u8; 180]).unwrap();
     }
     // 再写一条新数据（落在滚动后的新段）。
-    s.write(100, 0, 0, &vec![0xAA; 180]).unwrap();
+    s.write(100, 0, 0, &[0xAA; 180]).unwrap();
     s.flush().unwrap();
 
     let stats = s

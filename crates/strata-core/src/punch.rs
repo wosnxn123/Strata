@@ -97,8 +97,8 @@ mod windows {
     use std::os::windows::io::AsRawHandle;
 
     // 手写 FFI 绑定（windows-sys 0.59 的 feature 组合下这两项不稳定）。
-    type BOOL = i32;
-    type HANDLE = *mut std::ffi::c_void;
+    type WinBool = i32;
+    type WinHandle = *mut std::ffi::c_void;
 
     #[repr(C)]
     struct FileZeroDataInformation {
@@ -109,7 +109,7 @@ mod windows {
     #[link(name = "kernel32")]
     extern "system" {
         fn DeviceIoControl(
-            h_device: HANDLE,
+            h_device: WinHandle,
             dw_io_control_code: u32,
             in_buffer: *const std::ffi::c_void,
             n_in_buffer_size: u32,
@@ -117,7 +117,7 @@ mod windows {
             n_out_buffer_size: u32,
             bytes_returned: *mut u32,
             overlapped: *mut std::ffi::c_void,
-        ) -> BOOL;
+        ) -> WinBool;
     }
 
     use super::{PunchOutcome, StrataError};
@@ -131,9 +131,7 @@ mod windows {
     /// FSCTL_SET_ZERO_DATA 把区间归零。任一步失败都返回 `Unsupported`。
     pub(super) fn punch(file: &mut File, offset: u64, len: u64) -> Result<PunchOutcome, StrataError> {
         // punch_hole 已保证 offset + len 不溢出。
-        let end = offset + len;
-
-        let handle = file.as_raw_handle() as HANDLE;
+        let handle = file.as_raw_handle() as WinHandle;
         let mut ret: u32 = 0;
 
         // 1) 设置稀疏属性；失败（例如卷不支持稀疏文件）→ Unsupported。
