@@ -121,6 +121,7 @@ unsafe fn handle(h: *mut c_void) -> Result<&'static SyncStore, String> {
 
 /// 构造 [`StoreConfig`]（布尔位按 C 约定：非 0 = 启用；
 /// `compression_threads` 负值按 0 = 自动处理）。
+#[allow(clippy::too_many_arguments)]
 fn config_from_parts(
     hot_level: i32,
     hot_enabled: i32,

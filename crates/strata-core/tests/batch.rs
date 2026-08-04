@@ -156,7 +156,7 @@ fn batch_threads_roundtrip() {
         };
         let mut s = Store::open(dir.path(), cfg).unwrap();
 
-        let mut rng = Lcg(0xC0FFEE_0DD5 + u64::from(threads));
+        let mut rng = Lcg(0x00C0_FFEE_0DD5 + u64::from(threads));
         let items: Vec<BatchItem> = (0..512)
             .map(|_| BatchItem {
                 x: rng.next_i32(),

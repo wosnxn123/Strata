@@ -465,7 +465,7 @@ impl Store {
         let want = if threads == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
         } else {
-            usize::from(threads)
+            threads as usize
         };
         let workers = want.min(items.len());
         let chunk = items.len().div_ceil(workers);
