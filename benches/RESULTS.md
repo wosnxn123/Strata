@@ -50,10 +50,10 @@ SieveCache 计费严格按页序列化字节，10 万条目下仍远低于 64MB 
 ### 5. 并行压缩（write_batch，2000 × 8KB 可压缩负载）
 
 ```
-serial = 553.82 ms    batch(threads=0 全核) = 87.00 ms    speedup = 6.37×
+serial = 528.68 ms    batch(threads=0 全核) = 75.42 ms    speedup = 7.01×
 ```
 
-压缩是纯函数，可跨核并行；落盘仍串行保序。**默认 `compression_threads=1` 串行**（游戏服 TPS 优先），并行是显式 opt-in：`threads=0`=全部可用核、`N≥2`=限 N 线程，用有界 `std::thread::scope` 分块（不走 rayon 全局池，可按 Store 限流、不与游戏线程抢全局池）。上面 6.37× 是 `threads=0` 在 32 核机（AMD EPYC 9K65）空闲时的结果（debug 构建 cargo test 口径；release 绝对值更低，比例同向）。
+压缩是纯函数，可跨核并行；落盘仍串行保序。**默认 `compression_threads=1` 串行**（游戏服 TPS 优先），并行是显式 opt-in：`threads=0`=全部可用核、`N≥2`=限 N 线程，用有界 `std::thread::scope` 分块（不走 rayon 全局池，可按 Store 限流、不与游戏线程抢全局池）。组提交（批尾一次段 sync + 一次日志 sync，fsync 成本 O(1)/批）后测得 7.01× 是 `threads=0` 在 32 核机（AMD EPYC 9K65）空闲时的结果（debug 构建 cargo test 口径；release 绝对值更低，比例同向）。
 
 ## Reproduce
 
