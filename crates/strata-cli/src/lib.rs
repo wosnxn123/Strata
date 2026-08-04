@@ -230,9 +230,7 @@ fn remove_with_retry(path: &Path) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     }
-    Err(last.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "retry exhausted")
-    }))
+    Err(last.unwrap_or_else(|| std::io::Error::other("retry exhausted")))
 }
 
 /// Windows 上新写入的文件可能被杀软/索引器短暂锁定：目录删除失败时重试。
@@ -248,9 +246,7 @@ fn remove_dir_with_retry(path: &Path) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     }
-    Err(last.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "retry exhausted")
-    }))
+    Err(last.unwrap_or_else(|| std::io::Error::other("retry exhausted")))
 }
 
 /// Anvil → Strata：覆盖目标 vstore、保留 Anvil 源。
