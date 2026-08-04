@@ -5,8 +5,11 @@ import dev.strata.bridge.StrataNative;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.nbt.CompoundTag;
@@ -16,13 +19,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Owns one Strata virtual store (vstore) rooted at {@code <worldRoot>/vstore}
+ * Owns one Strata virtual store (vstore) rooted at {@code <dimDir>/vstore}
  * and the per-dimension registry of open stores.
  *
- * <p>One vstore serves all three record types (chunk/entity/poi) of a world
- * root — exactly the layout the strata-cli converter produces — so
- * overworld, nether and end stores live next to their Anvil directories and
- * remain CLI-compatible.</p>
+ * <p>One vstore serves all three record types (chunk/entity/poi) of a
+ * dimension directory — exactly the layout the strata-cli converter
+ * produces — so overworld, nether, end and plugin-created world stores all
+ * live next to their Anvil directories and remain CLI-compatible. The
+ * {@code strata.properties} configuration is shared per world root.</p>
  *
  * <p>Every failure path degrades to plain Anvil: a missing or broken native
  * library can never take the server down.</p>
@@ -35,17 +39,19 @@ public final class StrataWorld {
     private static boolean nativeLoadFailed;
     private static volatile boolean nativeLoaded;
 
-    /** Open stores keyed by the absolute, normalized world root path. */
+    /** Open stores keyed by the absolute, normalized dimension directory. */
     private static final Map<Path, StrataWorld> REGISTRY = new ConcurrentHashMap<>();
 
-    private final Path worldRoot;
+    private final Path configRoot;
+    private final Path dimDir;
     private final Path vstore;
     private final StrataConfig config;
     private volatile long handle;
 
-    private StrataWorld(final Path worldRoot, final StrataConfig config, final long handle) {
-        this.worldRoot = worldRoot;
-        this.vstore = worldRoot.resolve("vstore");
+    private StrataWorld(final Path configRoot, final Path dimDir, final StrataConfig config, final long handle) {
+        this.configRoot = configRoot;
+        this.dimDir = dimDir;
+        this.vstore = dimDir.resolve("vstore");
         this.config = config;
         this.handle = handle;
     }
@@ -91,17 +97,22 @@ public final class StrataWorld {
     }
 
     /**
-     * Opens (or reuses) the vstore for {@code worldRoot}. Returns
-     * {@code null} when Strata is disabled there or anything fails to open —
-     * in both cases the caller keeps its original Anvil behavior untouched.
+     * Opens (or reuses) the vstore for one dimension directory
+     * {@code dimDir} ({@code <dimDir>/vstore}), reading the shared
+     * {@code strata.properties} from {@code configRoot} (the world root).
+     * Returns {@code null} when Strata is disabled there or anything fails
+     * to open — in both cases the caller keeps its original Anvil behavior
+     * untouched.
      *
      * @param writeTemplateIfMissing creates the CLI template
      *                               {@code strata.properties} on first start
-     *                               (used for the overworld root only)
+     *                               (only the overworld level passes
+     *                               {@code true})
      */
-    public static StrataWorld openFor(final Path worldRoot, final boolean writeTemplateIfMissing) {
-        final Path root = worldRoot.toAbsolutePath().normalize();
-        final StrataWorld existing = REGISTRY.get(root);
+    public static StrataWorld openFor(final Path configRoot, final Path dimDir, final boolean writeTemplateIfMissing) {
+        final Path root = configRoot.toAbsolutePath().normalize();
+        final Path dim = dimDir.toAbsolutePath().normalize();
+        final StrataWorld existing = REGISTRY.get(dim);
         if (existing != null) {
             return existing;
         }
@@ -116,7 +127,7 @@ public final class StrataWorld {
             return null;
         }
         try {
-            final Path vstore = root.resolve("vstore");
+            final Path vstore = dim.resolve("vstore");
             Files.createDirectories(vstore);
             final long handle = StrataNative.open(
                 vstore.toString(),
@@ -129,41 +140,102 @@ public final class StrataWorld {
             );
             if (handle == 0L) {
                 LOGGER.warn("[strata] store open returned null handle for {} ({}), falling back to Anvil",
-                    root, StrataNative.lastError());
+                    dim, StrataNative.lastError());
                 return null;
             }
-            final StrataWorld store = new StrataWorld(root, config, handle);
-            final StrataWorld race = REGISTRY.putIfAbsent(root, store);
+            final StrataWorld store = new StrataWorld(root, dim, config, handle);
+            final StrataWorld race = REGISTRY.putIfAbsent(dim, store);
             if (race != null) {
                 StrataNative.close(handle);
                 return race;
             }
-            LOGGER.info("[strata] virtual store online for {} (root={})", root, vstore);
+            LOGGER.info("[strata] virtual store online for {} (config={}, vstore={})", dim, root, vstore);
             if (config.tieringEnabled) {
                 try {
                     StrataNative.tier(handle, true, config.tieringStableFlushes, config.tieringDemoteRatio);
                 } catch (final StrataException e) {
-                    LOGGER.warn("[strata] tiering enable failed for {}: {}", root, e.getMessage());
+                    LOGGER.warn("[strata] tiering enable failed for {}: {}", dim, e.getMessage());
                 }
             }
             return store;
         } catch (final IOException | RuntimeException e) { // StrataException is a RuntimeException
-            LOGGER.warn("[strata] store unavailable for {}, falling back to Anvil: {}", root, e.getMessage());
+            LOGGER.warn("[strata] store unavailable for {}, falling back to Anvil: {}", dim, e.getMessage());
             return null;
         }
     }
 
-    /** Returns the open store for {@code worldRoot}, or {@code null}. */
-    public static StrataWorld get(final Path worldRoot) {
-        return REGISTRY.get(worldRoot.toAbsolutePath().normalize());
+    /** Returns the open store for the dimension directory {@code dimDir}, or {@code null}. */
+    public static StrataWorld get(final Path dimDir) {
+        return REGISTRY.get(dimDir.toAbsolutePath().normalize());
+    }
+
+    /**
+     * Detects every dimension root under {@code worldRoot} — same order and
+     * validity rules as the strata-cli:
+     *
+     * <ol>
+     *   <li>{@code worldRoot} itself (the overworld);</li>
+     *   <li>{@code worldRoot/DIM-1} and {@code worldRoot/DIM1} (vanilla
+     *       layout);</li>
+     *   <li>each {@code worldRoot/dimensions/minecraft/<name>} subdirectory
+     *       (Canvas/Paper layout).</li>
+     * </ol>
+     *
+     * A directory counts as a dimension root when it holds at least one of
+     * {@code region/}, {@code entities/} or {@code poi/}. The result is
+     * ordered, deduplicated and normalized; pure java.nio.file, no native
+     * library required.
+     */
+    public static List<Path> dimensionRoots(final Path worldRoot) {
+        final Path root = worldRoot.toAbsolutePath().normalize();
+        final List<Path> candidates = new ArrayList<>();
+        candidates.add(root);
+        candidates.add(root.resolve("DIM-1"));
+        candidates.add(root.resolve("DIM1"));
+        final Path dimensions = root.resolve("dimensions").resolve("minecraft");
+        if (Files.isDirectory(dimensions)) {
+            final List<Path> subdirs = new ArrayList<>();
+            try (final DirectoryStream<Path> stream = Files.newDirectoryStream(dimensions)) {
+                for (final Path entry : stream) {
+                    if (Files.isDirectory(entry)) {
+                        subdirs.add(entry);
+                    }
+                }
+            } catch (final IOException e) {
+                LOGGER.warn("[strata] could not enumerate {}: {}", dimensions, e.getMessage());
+            }
+            subdirs.sort(Path::compareTo);
+            candidates.addAll(subdirs);
+        }
+        final List<Path> result = new ArrayList<>();
+        for (final Path candidate : candidates) {
+            if (!Files.isDirectory(candidate)) {
+                continue;
+            }
+            if (Files.isDirectory(candidate.resolve("region"))
+                || Files.isDirectory(candidate.resolve("entities"))
+                || Files.isDirectory(candidate.resolve("poi"))) {
+                final Path normalized = candidate.toAbsolutePath().normalize();
+                if (!result.contains(normalized)) {
+                    result.add(normalized);
+                }
+            }
+        }
+        return result;
     }
 
     public boolean enabled() {
         return this.handle != 0L;
     }
 
+    /** The world root this store reads its {@code strata.properties} from. */
     public Path worldRoot() {
-        return this.worldRoot;
+        return this.configRoot;
+    }
+
+    /** The dimension directory this store belongs to ({@code <dimDir>/vstore}). */
+    public Path dimDir() {
+        return this.dimDir;
     }
 
     public Path vstoreRoot() {

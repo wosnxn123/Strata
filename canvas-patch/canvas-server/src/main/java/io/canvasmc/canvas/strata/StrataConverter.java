@@ -37,7 +37,12 @@ import org.slf4j.LoggerFactory;
  *       files, leaving the vstore in place.</li>
  * </ul>
  *
- * Both directions run entirely on the calling thread (the startup hook and
+ * <p>Both entry points detect every dimension root under the given world
+ * root ({@link StrataWorld#dimensionRoots(Path)}) and convert each one
+ * into its own {@code <dimRoot>/vstore}, reporting every dimension
+ * individually.
+ *
+ * <p>Both directions run entirely on the calling thread (the startup hook and
  * the {@code /canvas strata convert} command both invoke them outside the
  * tick) and never touch live world files while the server runs.
  */
@@ -68,12 +73,29 @@ public final class StrataConverter {
     }
 
     /**
-     * Converts a world directory from Anvil to Strata. Overwrites any
-     * existing vstore, keeps the Anvil sources (operators verify, then delete
-     * them manually — same contract as the CLI).
+     * Converts every dimension detected under {@code worldDir} from Anvil to
+     * Strata. Dimensions are detected CLI-parity
+     * ({@link StrataWorld#dimensionRoots(Path)}); each dimension's
+     * {@code region/}, {@code entities/} and {@code poi/} files are read
+     * into its own fresh {@code <dimRoot>/vstore} (overwriting any existing
+     * one), and the Anvil sources stay in place (operators verify, then
+     * delete them manually — same contract as the CLI). Every dimension is
+     * reported individually; the returned report aggregates all of them.
      */
     public static Report convertToStrata(final Path worldDir, final StrataConfig config) throws IOException {
-        final Path vstore = worldDir.resolve("vstore");
+        long regions = 0L;
+        long records = 0L;
+        for (final Path dimRoot : conversionRoots(worldDir)) {
+            final Report report = convertDimToStrata(dimRoot, config);
+            regions += report.regions();
+            records += report.records();
+        }
+        return new Report(regions, records, 0L);
+    }
+
+    /** Conversion core: one dimension root from Anvil to Strata. */
+    private static Report convertDimToStrata(final Path dimDir, final StrataConfig config) throws IOException {
+        final Path vstore = dimDir.resolve("vstore");
         if (Files.isDirectory(vstore)) {
             deleteRecursively(vstore);
         }
@@ -92,7 +114,7 @@ public final class StrataConverter {
             long regions = 0L;
             long records = 0L;
             for (int kind = 0; kind < SOURCE_DIRS.length; kind++) {
-                final Path dir = worldDir.resolve(SOURCE_DIRS[kind]);
+                final Path dir = dimDir.resolve(SOURCE_DIRS[kind]);
                 if (!Files.isDirectory(dir)) {
                     continue;
                 }
@@ -120,16 +142,42 @@ public final class StrataConverter {
     }
 
     /**
-     * Converts a world directory from Strata back to Anvil. Uses the existing
-     * Anvil region files as the key manifest (the CLI does the same: the
-     * vstore is enumerated by scanning segment files, which the FFI does not
-     * expose), rewriting each region file atomically via a temp file. The
-     * vstore stays in place.
+     * Converts every dimension detected under {@code worldDir} from Strata
+     * back to Anvil (detection as in {@link #convertToStrata}). Uses the
+     * existing Anvil region files as the key manifest (the CLI does the
+     * same: the vstore is enumerated by scanning segment files, which the
+     * FFI does not expose), rewriting each region file atomically via a temp
+     * file. The vstore stays in place. Dimensions without a vstore are
+     * skipped; when no dimension has one the call fails. Every dimension is
+     * reported individually; the returned report aggregates all of them.
      */
     public static Report convertToAnvil(final Path worldDir, final StrataConfig config) throws IOException {
-        final Path vstore = worldDir.resolve("vstore");
-        if (!Files.isDirectory(vstore)) {
+        long regions = 0L;
+        long records = 0L;
+        long skipped = 0L;
+        boolean convertedAny = false;
+        for (final Path dimRoot : conversionRoots(worldDir)) {
+            if (!Files.isDirectory(dimRoot.resolve("vstore"))) {
+                LOGGER.info("No vstore under {}, skipping this dimension", dimRoot);
+                continue;
+            }
+            final Report report = convertDimToAnvil(dimRoot, config);
+            convertedAny = true;
+            regions += report.regions();
+            records += report.records();
+            skipped += report.skipped();
+        }
+        if (!convertedAny) {
             throw new IOException(worldDir + ": no vstore directory, nothing to convert");
+        }
+        return new Report(regions, records, skipped);
+    }
+
+    /** Conversion core: one dimension root from Strata back to Anvil. */
+    private static Report convertDimToAnvil(final Path dimDir, final StrataConfig config) throws IOException {
+        final Path vstore = dimDir.resolve("vstore");
+        if (!Files.isDirectory(vstore)) {
+            throw new IOException(dimDir + ": no vstore directory, nothing to convert");
         }
         if (!StrataWorld.ensureNative()) {
             throw new IOException("Strata native library is unavailable; cannot convert");
@@ -147,7 +195,7 @@ public final class StrataConverter {
             long records = 0L;
             long skipped = 0L;
             for (int kind = 0; kind < SOURCE_DIRS.length; kind++) {
-                final Path dir = worldDir.resolve(SOURCE_DIRS[kind]);
+                final Path dir = dimDir.resolve(SOURCE_DIRS[kind]);
                 if (!Files.isDirectory(dir)) {
                     continue;
                 }
@@ -182,6 +230,17 @@ public final class StrataConverter {
                 StrataNative.close(handle);
             }
         }
+    }
+
+    /**
+     * The dimension roots to convert for a world root: the CLI-parity
+     * detection of {@link StrataWorld#dimensionRoots(Path)}, falling back to
+     * the world root itself when nothing is detected (e.g. a world without
+     * region files yet) so the legacy single-root behavior is preserved.
+     */
+    private static List<Path> conversionRoots(final Path worldDir) {
+        final List<Path> roots = StrataWorld.dimensionRoots(worldDir);
+        return roots.isEmpty() ? List.of(worldDir.toAbsolutePath().normalize()) : roots;
     }
 
     /** Reads one Anvil region file into its present chunks (NBT decompressed). */

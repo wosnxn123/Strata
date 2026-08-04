@@ -197,18 +197,25 @@ public final class StrataConfig {
 
     /** Same template the strata-cli writes when the file is missing. */
     private static final String TEMPLATE = """
-        # Strata storage configuration
+        # Strata storage configuration / Strata 存储配置
+        # Master switch (default off — opt in) / 总开关（默认关闭，需显式启用）
         strata.enabled=false
+        # Cold tier (hot -> cold migration) / 冷层（热→冷迁移）
         strata.tiering.enabled=true
         strata.tiering.stable-flushes=30
         strata.tiering.invalid-demote-ratio=0.25
+        # Compression / 压缩
         strata.compression.hot-enabled=true
         strata.compression.cold-enabled=true
         strata.compression.hot=zstd-3
         strata.compression.cold=zstd-9
         strata.compression.dictionary=true
+        # Batch compression workers: 0=auto(all cores) 1=serial(default, TPS-first) N>=2=capped
+        # 批量压缩线程：0=自动(全核) 1=串行(默认,TPS优先) N≥2=限N线程
         strata.compression.threads=1
+        # Index memory budget (MiB) / 索引内存预算（MiB）
         strata.index.cache-mb=512
+        # GC / 垃圾回收
         strata.gc.enabled=true
         strata.gc.invalid-threshold=0.6
         strata.gc.budget-bytes=33554432

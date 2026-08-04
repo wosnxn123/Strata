@@ -1,17 +1,17 @@
 # Strata Storage — Canvas Integration Patch
 
-Status: **complete and build-verified** (applyAllPatches + compileJava + createPaperclipJar all green on CNB, JDK 25, weaver-patcher 2.4.5, MC 26.2, fork HEAD 3f18522).
+Status: **complete and build-verified** (applyAllPatches + compileJava + createPaperclipJar all green on CNB, JDK 25, weaver-patcher 2.4.5, MC 26.2). Round 3: multi-world/multi-dimension extension (per-level vstore at `<dimDir>/vstore`, shared config at world root); 9-parameter `StrataNative.open` with `compressionThreads`.
 
 ## Contents
 
-```
-minecraft-patches/features/0004-Strata-Storage.patch   weaver feature patch (6 files)
-paper-patches/features/0001-Strata-Storage.patch       weaver feature patch (CraftBukkit Main flags)
+minecraft-patches/features/0004-Strata-Storage.patch   weaver feature patch (6 files; multi-world ServerLevel hook)
+paper-patches/features/0001-Strata-Storage.patch       weaver feature patch (CraftBukkit Main flags, unchanged)
 GlobalConfiguration.diff                                /strata command registration (main repo)
+fork-commit-multiworld.patch                            git format-patch of the full fork commit 3812aae (push blocked: no GitHub creds on CNB; apply with git am)
 canvas-server/src/main/java/                            plain sources for the main canvas repo:
   dev/strata/bridge/StrataNative.java                   vendored JNI bridge
   dev/strata/bridge/StrataException.java
-  io/canvasmc/canvas/strata/StrataWorld.java            per-world-root vstore owner + registry
+  io/canvasmc/canvas/strata/StrataWorld.java            per-dimension vstore owner + registry (multi-world)
   io/canvasmc/canvas/strata/StrataConfig.java           strata.properties parser (CLI parity)
   io/canvasmc/canvas/strata/StrataConverter.java        Anvil<->vstore converter
   io/canvasmc/canvas/strata/StrataStartup.java          startup-flag conversion runner
@@ -39,13 +39,16 @@ exact tree verified to compile.
 ## What the patch does
 
 - **Config**: `<worldRoot>/strata.properties`, key `strata.enabled` (default
-  `false`, template auto-created on first start of the overworld). Disabled =>
+  `false`, template auto-created on first start of the overworld). Additional
+  key `strata.compression.threads` (default 1 = serial; 0 = auto; N ≥ 2 =
+  bounded batch-write compression workers). Disabled =>
   every code path is byte-identical to upstream (all hooks null-check the
   per-level store handle, which is only opened when enabled).
-- **Scope**: CLI-parity Phase 1 — only the **overworld** world root
-  (`<world>/vstore`) is routed to Strata; nether/end keep Anvil. One vstore
-  serves all three record types (chunk=0, entity=1, poi=2), matching
-  strata-cli's layout.
+- **Scope**: multi-world — every level (overworld/nether/end and
+  plugin-created worlds) resolves its own dimension directory and gets its
+  own vstore at `<dimDir>/vstore`; the shared config (`strata.properties`)
+  is read from the world root. One vstore serves all three record types
+  (chunk=0, entity=1, poi=2), matching strata-cli's layout.
 - **Read routing** (`readData` in Chunk/Entity/Poi DataController): vstore
   first -> HIT returns `SYNC_READ` with the parsed CompoundTag; DELETED
   (empty-payload marker) returns `NO_DATA`; MISS or any error falls through
@@ -99,16 +102,28 @@ Runs the conversion **before** world load, prints the keep-the-source
 reminder, then boots normally (Cesium-style). A failed conversion aborts
 startup to avoid a mixed-format world. Remove the flag afterwards.
 
-## Build evidence (CNB, 2026-08-04)
+## Build evidence (CNB, 2026-08-04/05)
+
+Round 3 (multi-world/dimension extension, strata 7564046):
 
 ```
-applyAllPatches:        BUILD SUCCESSFUL in 1m 7s
-:canvas-server:compileJava: BUILD SUCCESSFUL
-createPaperclipJar:     BUILD SUCCESSFUL in 1m 6s
-  -> canvas-server/build/libs/canvas-paperclip-26.2.local-SNAPSHOT.jar
+weaver rebuild (both):       BUILD SUCCESSFUL in 6s (GRADLE_RC=0)
+  0004 vs local reference:   byte-identical hunks; only the git index-hash line
+                             differs (weaver format artifact, not content)
+  0001:                      unchanged (md5 41837d8cb1beb06fe320b64e1532cba6)
+applyAllPatches:             BUILD SUCCESSFUL in 24s (APPLY_RC=0)
+:canvas-server:compileJava:  BUILD SUCCESSFUL in 33s (COMPILE_RC=0)  ← key gate
+:canvas-server:createPaperclipJar: BUILD SUCCESSFUL in 46s (JAR_RC=0)
+  -> /root/canvas/canvas-server/build/libs/canvas-paperclip-26.2.local-SNAPSHOT.jar (62,947,874 bytes)
 ```
 
-Compile errors fixed along the way: 1 (multi-catch subclassing,
+Fork commit `3812aae4c4d51883e72200079ed4651ecd590a07` on CNB /root/canvas main
+(10 files: 2 patches + GlobalConfiguration + 7 sources). Push to GitHub
+**blocked** (no usable GitHub credentials on CNB); shipped here as
+`fork-commit-multiworld.patch` (apply with `git am`).
+
+Round 2 history: 9-param `open` (compressionThreads) rework, patches
+byte-identical. Round 1: 1 compile error fixed (multi-catch subclassing,
 `StrataException` already extends `RuntimeException`).
 
 ## Known limitations / risks
@@ -120,6 +135,7 @@ Compile errors fixed along the way: 1 (multi-catch subclassing,
 - A chunk deleted while Strata is active writes an empty-payload marker to the
   vstore and clears the Anvil copy; if Strata is later disabled without
   converting back, that chunk appears gone to Anvil-only readers.
-- Overworld-only (Phase 1, matching strata-cli); nether/end always Anvil.
+- strata-cli itself still converts overworld only; the server-side converter
+  here walks all dimensions of the world root.
 - Mojang manifest downloads from CNB needed a hosts pin (`piston-meta.mojang.com`);
   unrelated to the patch itself.

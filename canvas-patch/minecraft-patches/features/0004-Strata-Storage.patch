@@ -197,14 +197,14 @@ index 3ea53abdbf0a089fdce5a650acac93dbd5c02410..5c913eec7cc89109b987df7f1faffc38
              this.storageSource.close();
          } catch (IOException e) {
 diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
-index d5775f7367f380c0f69471cbd694aeef681d2da7..4ef28167e0946a7dfe9fe9c4faeb486d0c022279 100644
+index d5775f7367f380c0f69471cbd694aeef681d2da7..0936ed84ea82a2f9cd2d91ad481baf3ab2ac0379 100644
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
 @@ -329,6 +329,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
      private final ca.spottedleaf.moonrise.patches.chunk_system.io.datacontroller.PoiDataController poiDataController;
      private final ca.spottedleaf.moonrise.patches.chunk_system.io.datacontroller.ChunkDataController chunkDataController;
      private final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkTaskScheduler chunkTaskScheduler;
-+    private final io.canvasmc.canvas.strata.StrataWorld canvas$strataWorld; // Canvas - Strata storage (overworld only, null when disabled/unavailable)
++    private final io.canvasmc.canvas.strata.StrataWorld canvas$strataWorld; // Canvas - Strata storage (per-level, null when disabled/unavailable)
      private long lastMidTickFailure;
      private long tickedBlocksOrFluids;
      // Folia - region threading - move to regionized data
@@ -222,18 +222,20 @@ index d5775f7367f380c0f69471cbd694aeef681d2da7..4ef28167e0946a7dfe9fe9c4faeb486d
      @Override
      public final int moonrise$getRegionChunkShift() {
          return this.regioniser.sectionChunkShift; // Folia - region threading
-@@ -714,6 +722,17 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -714,6 +722,19 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
          int simulationDistance = this.serverLevelData.canvas$distanceConfig.simulationDistanceOrDefault();
          this.chunkSource.setSimulationDistance(simulationDistance);
          // Canvas end - per world distance
 +
 +        // Canvas start - Strata storage
-+        // CLI parity: strata-cli Phase 1 converts only the overworld world root
-+        // (<world>/vstore), so only the primary level is routed to the vstore;
-+        // every other dimension keeps the original Anvil path.
++        // Every level (overworld/nether/end, including plugin-created worlds)
++        // resolves its own dimension directory and gets its own vstore at
++        // <dimDir>/vstore; config (strata.properties) is read from the world root.
 +        io.canvasmc.canvas.strata.StrataWorld canvas$strataWorldInit = null;
-+        if (server.storageSource != null && dimension == net.minecraft.world.level.Level.OVERWORLD) {
-+            canvas$strataWorldInit = io.canvasmc.canvas.strata.StrataWorld.openFor(server.storageSource.getLevelPath(net.minecraft.world.level.storage.LevelResource.ROOT), true);
++        if (levelStorage != null) {
++            final java.nio.file.Path canvas$strataDimDir = levelStorage.getDimensionPath(dimension);
++            final java.nio.file.Path canvas$strataConfigRoot = levelStorage.getLevelPath(net.minecraft.world.level.storage.LevelResource.ROOT);
++            canvas$strataWorldInit = io.canvasmc.canvas.strata.StrataWorld.openFor(canvas$strataConfigRoot, canvas$strataDimDir, dimension == net.minecraft.world.level.Level.OVERWORLD);
 +        }
 +        this.canvas$strataWorld = canvas$strataWorldInit;
 +        // Canvas end - Strata storage
