@@ -46,6 +46,15 @@ sieve_lookup_10k         time: [163.41 µs 163.53 µs]
 
 SieveCache 计费严格按页序列化字节，10 万条目下仍远低于 64MB 预算——内存与世界大小无关的性质成立（RSS 采样留待实机长时基准）。
 
+
+### 5. 并行压缩（write_batch，2000 × 8KB 可压缩负载，rayon 并行压缩 + 串行追加）
+
+```
+serial = 131.24 ms    batch = 58.38 ms    speedup = 2.25×
+```
+
+Phase 2 新增：压缩是纯函数，rayon 跨核并行；落盘仍串行保序。32 核机器上 2.25× 加速（数据集 16MB 级，核数未吃满；更大批量收益更高）。
+
 ## Reproduce
 
 ```bash
