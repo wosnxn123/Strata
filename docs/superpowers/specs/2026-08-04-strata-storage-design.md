@@ -277,6 +277,8 @@ strata.compression.cold-enabled=true
 strata.compression.hot=zstd-3
 strata.compression.cold=zstd-9
 strata.compression.dictionary=true
+# 批量压缩工作线程：0=自动(全核) 1=串行(默认,TPS优先) N≥2=限N线程
+strata.compression.threads=1
 # 索引内存上界
 strata.index.cache-mb=512
 # GC
@@ -286,6 +288,7 @@ strata.gc.budget-bytes=33554432
 ```
 
 **级别范围**：zstd -10 ~ 22（0 非法——"库默认"语义歧义；越界报行号错误）。
+**批量压缩并行策略**：`write_batch` 的压缩默认**串行**（`threads=1`），因游戏服 CPU 稀缺、TPS 优先于压缩吞吐；显式 `threads=0`（全部可用核）或 `N≥2` 时，用**有界 `std::thread::scope`** 派生 worker 分块压缩——不用 rayon 全局池（全局单例无法按 Store 限流，且会与游戏线程抢核）。结果与输入同序，任一 worker 出错即整批失败（追加尚未发生）。
 **非法值** → 启动报错并指明 `strata.properties:<行号>: <原因>`，不静默回退。
 
 ### 组合合法性矩阵
@@ -319,7 +322,7 @@ strata.gc.budget-bytes=33554432
 - **保留源格式**：转换**绝不删除**源（`region/`/`entities/`/`poi/` 或 `vstore/`），运维验证后**手动删除**；结束时打印醒目提示与源目录列表。
 - **可恢复进度**：每 region 完成追加 `vstore/.convert-progress` 一行 + fsync；中断重跑跳过已完成；全部完成后删除进度文件。
 - **全量 + 当前配置**：遍历所有 region/entities/poi `.mca`，按当前 `strata.properties` 压缩级别写 vstore；反向转 Anvil 固定 DEFLATE（Anvil 不支持 zstd）。中断期间改配置会造成混级别（合法但不一致）。
-- Phase 1 CLI 仅支持 overworld 维度；DIM-1 等报"暂不支持"。
+- **多维度 + 多世界**：CLI 与服务端均按维度根遍历——overworld（世界根本身）、vanilla 布局 `DIM-1`/`DIM1`、Canvas/Paper 布局 `dimensions/minecraft/<dim>`；每个维度根一个独立 vstore（`<dimroot>/vstore`）。多世界插件（Multiverse 等）创建的世界是普通世界根，逐世界执行即全兼容。
 
 ---
 
@@ -361,5 +364,5 @@ strata.gc.budget-bytes=33554432
 - 学习索引（Bourbon/CARMI 完整版）：键空间泛化时再评估
 - per-type 之外的多字典策略 / lzma2 冷层 codec（注册表已留扩展位）
 - `strata-cli recompress <world>` 全量重压维护命令
-- Nether/End 维度转换（Phase 1 仅 overworld）
+- ~~Nether/End 维度转换~~ ✅ 已实现（多维度遍历 + 每维度独立 vstore）；多世界（插件创建的世界）同步支持
 - playerdata/stats/advancements/savedata 纳入（Phase 1 仅三大件，信封 type_id 已预留）
