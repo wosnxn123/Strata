@@ -4,18 +4,25 @@
 //!
 //! ```text
 //! root/
+//! ├─ .strata.lock                   # 会话锁（SessionLock，进程独占）
 //! ├─ manifest.vsm (+ .bak)          # Manifest::save/load
 //! ├─ segments/seg-XXXX.vseg         # 段数据（4 位零填充编号）
 //! ├─ segments/seg-XXXX.vix          # 每段的磁盘索引页（IndexPage::serialize）
+//! ├─ cold/r.{rx}.{rz}.varc (+ .inv) # 冷归档（tier 晋升产物）
 //! └─ epoch/current.velog            # EpochLog::open(root/epoch)
 //! ```
+//!
+//! 崩溃一致性原则：**替代物持久化之前绝不删旧物；日志不得先于数据**。
+//! - write：段数据 sync → epoch 条目 flush+sync（返回即持久）；
+//! - alloc：段文件头落盘 → manifest 登记（epoch 条目引用的段必在盘上 manifest 中）；
+//! - compact：新段数据+索引页落盘 → manifest 换段 → 才删旧段；
+//! - 回放：未知 seg_id 按段头认领；越界条目丢弃；next_gen 与回放观察值对齐。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use xxhash_rust::xxh64::xxh64;
 
@@ -25,10 +32,11 @@ use crate::envelope::{Envelope, ENVELOPE_SIZE};
 use crate::epoch::{EpochEntry, EpochLog};
 use crate::gc;
 use crate::index::{IndexKey, IndexPage, IndexVal, RegionBitmap, SieveCache};
+use crate::lock::SessionLock;
 use crate::manifest::{
-    Bucket, Manifest, RegionKey, SegmentMeta, FORMAT_VERSION, REGION_BITMAP_BYTES,
+    rename_replace, Bucket, ColdMeta, Manifest, RegionKey, SegmentMeta, FORMAT_VERSION,
 };
-use crate::segment::{scan_segment, SegmentWriter};
+use crate::segment::{scan_segment, segment_header_ok, SegmentWriter};
 use crate::StrataError;
 
 /// 段文件子目录。
@@ -54,13 +62,14 @@ pub(crate) fn cold_path(root: &Path, region_x: i32, region_z: i32) -> PathBuf {
 }
 
 /// Windows 上新建/刚写过的文件可能被杀软或索引器短暂锁定：删除遇到
-/// `PermissionDenied` 时 sleep 50ms 重试（共 3 次），与 strata-cli 同策略。
+/// `ERROR_ACCESS_DENIED (5)` / `ERROR_SHARING_VIOLATION (32)` 时 sleep 50ms
+/// 重试（共 3 次），与 strata-cli 同策略。其他错误码不重试，直接上抛。
 pub(crate) fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
     let mut last = None;
     for _ in 0..3 {
         match std::fs::remove_file(path) {
             Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(e) if retryable_remove_error(&e) => {
                 last = Some(e);
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -68,6 +77,17 @@ pub(crate) fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
         }
     }
     Err(last.unwrap_or_else(|| std::io::Error::other("retry exhausted")))
+}
+
+#[cfg(windows)]
+fn retryable_remove_error(e: &std::io::Error) -> bool {
+    // ERROR_ACCESS_DENIED = 5, ERROR_SHARING_VIOLATION = 32
+    matches!(e.raw_os_error(), Some(5) | Some(32))
+}
+
+#[cfg(not(windows))]
+fn retryable_remove_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied
 }
 
 /// Store 配置。
@@ -135,6 +155,7 @@ pub struct BatchWriteResult {
 /// 单个段的内存状态：L0 位图 + 磁盘索引页（在 [`Store::cache`] 中）+ 未落盘增量。
 pub(crate) struct SegState {
     /// 段内记录的存在性位图（坐标按 32×32 折叠，跨 region 的超集过滤器）。
+    /// vstore v3 起这是唯一位图：manifest 不再持久化任何 region 位图快照。
     pub(crate) bitmap: RegionBitmap,
     /// 尚未合并进磁盘页的索引条目（追加序，gen 单调递增）。
     pub(crate) incremental: Vec<(IndexKey, IndexVal)>,
@@ -150,21 +171,36 @@ impl SegState {
 }
 
 /// vstore 门面。
+///
+/// 线程模型：全部字段均为 `Send + Sync`（内部可变性只通过 `Mutex`），
+/// 编译器自动派生，无需 unsafe 断言。`SyncStore` 在此之上用 `RwLock`
+/// 串行化 `&mut self` 写路径，读路径（`read`/`verify`/`touch_stats`）
+/// 可多线程并发：索引页缓存与冷归档读取器各自以 `Mutex` 短临界区共享。
 pub struct Store {
     pub(crate) root: PathBuf,
     pub(crate) cfg: StoreConfig,
     pub(crate) manifest: Manifest,
     /// 每段的位图 + 未落盘增量（磁盘索引页在 `cache` 中）。
     pub(crate) segs: HashMap<u32, SegState>,
-    pub(crate) cache: SieveCache,
+    /// L1 索引页缓存（SIEVE）。`Mutex` 包装使 `&self` 读路径也能命中缓存。
+    pub(crate) cache: Mutex<SieveCache>,
     pub(crate) epoch: EpochLog,
     /// 当前活跃段写入器；`None` 时下次 write 按需创建新段。
     pub(crate) writer: Option<SegmentWriter>,
     pub(crate) active_seg: u32,
     /// open 以来的 flush 次数（分桶晋升用）。
     pub(crate) epoch_flush_count: u64,
-    /// 冷归档懒加载读取器（`read`/`write` 命中冷区时按需打开）。
-    pub(crate) cold_readers: RefCell<HashMap<RegionKey, ArchiveReader>>,
+    /// 冷归档懒加载读取器：外层 map 锁只做查表/插入（取走 `Arc` 即放锁），
+    /// 每个归档一把内层锁串行其上的块缓存与文件定位。
+    pub(crate) cold_readers: Mutex<HashMap<RegionKey, Arc<Mutex<ArchiveReader>>>>,
+    /// region → `manifest.cold` 槽位下标：O(1) 判定"该 region 是否有冷归档"
+    /// （读回落、回放跳过、失效记账、晋升查重共用）。
+    pub(crate) cold_lookup: HashMap<RegionKey, usize>,
+    /// demote 回写热层期间置位：暂停冷槽失效记账（见
+    /// [`Store::invalidate_cold_slot`] 的崩溃窗口说明）。
+    pub(crate) demote_in_progress: bool,
+    /// 会话独占锁；随 Store 存活，drop 时释放。
+    _lock: SessionLock,
 }
 
 /// 空 manifest（新 store 或 manifest 损坏重建时用）。
@@ -176,35 +212,35 @@ fn empty_manifest() -> Manifest {
     }
 }
 
-/// `cold_readers` 哈希键（manifest 的 `RegionKey` 未派生 `Hash`，此处补本地实现）。
-impl std::hash::Hash for RegionKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.x.hash(state);
-        self.z.hash(state);
-    }
+/// `LockResult` 松弛解包：持锁线程 panic 导致的中毒锁取回内层数据继续使用
+/// （锁保护的结构自身没有不变量被 panic 破坏的风险点，宁可用也不崩）。
+pub(crate) trait MutexExt<'a, T> {
+    fn unwrap_or_poisoned(self) -> MutexGuard<'a, T>;
 }
 
-/// # Safety
-///
-/// `Send` 由编译器自动派生（全部字段可 Send，含 `RefCell`）。此处仅补
-/// `Sync`——`cold_readers` 的 `RefCell` 阻碍自动 `Sync`，但跨线程安全性成立：
-/// Store 的可变状态串行化由借用检查保证，可变路径全部取 `&mut self`；只读
-/// 路径（`read`/`verify`/`touch_stats`）对 `cold_readers` 的借用使用
-/// `try_borrow_mut`（借不到即退化为本次调用私有的 ArchiveReader），不跨越任何
-/// `&mut self` 调用边界，因此跨线程不存在别名可变性。
-unsafe impl Sync for Store {}
+impl<'a, T> MutexExt<'a, T> for std::sync::LockResult<MutexGuard<'a, T>> {
+    fn unwrap_or_poisoned(self) -> MutexGuard<'a, T> {
+        self.unwrap_or_else(|p| p.into_inner())
+    }
+}
 
 impl Store {
     /// 打开（或创建）`root` 处的 vstore。
     ///
     /// manifest 缺失或损坏时按段文件扫描重建索引；正常打开路径**不**扫描段文件。
+    /// 打开顺序即恢复顺序：会话锁 → manifest → 重建（如需）→ 索引页 →
+    /// 冷区对账 → epoch 回放（认领孤儿段、丢弃越界条目、对齐 next_gen）。
     pub fn open(root: &Path, cfg: StoreConfig) -> Result<Self, StrataError> {
         std::fs::create_dir_all(root)?;
         std::fs::create_dir_all(root.join(SEGMENTS_DIR))?;
         std::fs::create_dir_all(root.join(EPOCH_DIR))?;
 
-        // manifest 缺失（None）或损坏（Err）都需要扫描重建：
-        // 缺失可能是"从未保存就崩溃"，此时段文件是唯一的真相来源。
+        // 会话锁：先于任何数据文件触碰；被占用直接带持有者信息报错。
+        let lock = SessionLock::acquire(root)?;
+
+        // manifest 缺失（None）或损坏/旧版本（Err）都需要扫描重建：
+        // 缺失可能是"从未保存就崩溃"，此时段文件是唯一的真相来源；
+        // 旧版本（v2 及以下）无迁移负担——段扫描 + 冷区对账即完整重建。
         let (manifest, needs_rebuild) = match Manifest::load(root) {
             Ok(Some(m)) => (m, false),
             Ok(None) => (empty_manifest(), true),
@@ -218,13 +254,17 @@ impl Store {
             cfg,
             manifest,
             segs: HashMap::new(),
-            cache: SieveCache::new(cache_budget),
+            cache: Mutex::new(SieveCache::new(cache_budget)),
             epoch,
             writer: None,
             active_seg: 0,
             epoch_flush_count: 0,
-            cold_readers: RefCell::new(HashMap::new()),
+            cold_readers: Mutex::new(HashMap::new()),
+            cold_lookup: HashMap::new(),
+            demote_in_progress: false,
+            _lock: lock,
         };
+        store.rebuild_cold_lookup();
 
         if needs_rebuild {
             store.rebuild_index_from_scan()?;
@@ -234,56 +274,92 @@ impl Store {
         let ids: Vec<u32> = store.manifest.segments.iter().map(|m| m.id).collect();
         for id in ids {
             let page = match std::fs::read(ix_path(root, id)) {
-                Ok(bytes) => IndexPage::deserialize(&bytes).unwrap_or_else(|_| IndexPage::from_entries(Vec::new())),
+                Ok(bytes) => IndexPage::deserialize(&bytes)
+                    .unwrap_or_else(|_| IndexPage::from_entries(Vec::new())),
                 Err(_) => IndexPage::from_entries(Vec::new()),
             };
             let st = store.segs.entry(id).or_insert_with(SegState::new);
             for (k, _) in page.iter() {
                 st.bitmap.set(k.x, k.z, k.type_id);
             }
-            store.cache.put(id, Arc::new(page));
+            store.cache.lock().unwrap_or_poisoned().put(id, Arc::new(page));
         }
+
+        // 冷区对账先于回放：重建路径下回放需要冷区清单跳过已晋升键。
+        let mut dirty = store.reconcile_cold()?;
 
         // epoch 回放：日志里的记录可能比 .vix 新（崩溃前未 flush）。
         // 已晋升冷区的键不得被回放复活（否则热层重新索引到已搬走的数据）。
+        let mut max_gen: Option<u64> = None;
+        let mut seg_lens: HashMap<u32, u64> = HashMap::new();
         for e in store.epoch.replay()? {
+            // 回放观察到的最大 gen（含被跳过/丢弃的条目：gen 已被消耗过，
+            // 复用会让新旧版本 gen 冲突）。
+            max_gen = Some(max_gen.map_or(e.env.gen, |g| g.max(e.env.gen)));
+
             let rk = RegionKey {
                 x: e.env.chunk_x >> 5,
                 z: e.env.chunk_z >> 5,
             };
-            if store
-                .manifest
-                .cold
-                .iter()
-                .any(|c| c.region_x == rk.x && c.region_z == rk.z)
-            {
+            if store.cold_lookup.contains_key(&rk) {
                 continue;
             }
-            if let Some(st) = store.segs.get_mut(&e.seg_id) {
-                let key = IndexKey {
-                    x: e.env.chunk_x,
-                    z: e.env.chunk_z,
-                    type_id: e.env.type_id,
-                };
-                st.bitmap.set(key.x, key.z, key.type_id);
-                st.incremental.push((
-                    key,
-                    IndexVal {
-                        seg_id: e.seg_id,
-                        offset: e.offset,
-                        payload_len: e.env.payload_len,
-                        gen: e.env.gen,
-                        comp_id: e.env.comp_id,
-                    },
-                ));
+
+            // 幽灵条目防御：offset 超出段文件当前长度 = 数据未落盘
+            // （WAL 顺序保证数据先于日志，这里只是兜底）。
+            let seg_len = *seg_lens.entry(e.seg_id).or_insert_with(|| {
+                std::fs::metadata(seg_path(root, e.seg_id))
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            });
+            let need = ENVELOPE_SIZE as u64 + e.env.payload_len as u64;
+            if e.offset >= seg_len || e.offset + need > seg_len {
+                continue;
+            }
+
+            // 孤儿段认领：manifest 不认识该 seg_id 但文件存在且段头有效 →
+            // 按段头登记（而不是丢弃条目造成静默数据丢失）。
+            if !store.segs.contains_key(&e.seg_id) && !store.claim_segment(e.seg_id)? {
+                continue;
+            }
+            let st = store.segs.get_mut(&e.seg_id).expect("known or claimed above");
+            let key = IndexKey {
+                x: e.env.chunk_x,
+                z: e.env.chunk_z,
+                type_id: e.env.type_id,
+            };
+            st.bitmap.set(key.x, key.z, key.type_id);
+            st.incremental.push((
+                key,
+                IndexVal {
+                    seg_id: e.seg_id,
+                    offset: e.offset,
+                    payload_len: e.env.payload_len,
+                    gen: e.env.gen,
+                    comp_id: e.env.comp_id,
+                },
+            ));
+            dirty = true;
+        }
+
+        // next_gen 回卷防御：与 manifest 持久值取 max（与 rebuild 同规则）。
+        if let Some(g) = max_gen {
+            if store.manifest.next_gen <= g {
+                store.manifest.next_gen = g + 1;
+                dirty = true;
             }
         }
 
         store.active_seg = store.manifest.next_seg_id;
+        if dirty {
+            store.manifest.save(&store.root)?;
+        }
         Ok(store)
     }
 
     /// 写入一条记录（压缩 → 追加段 → epoch 日志 → 内存索引）。
+    ///
+    /// 持久化语义：返回 `Ok` 时记录已持久（段数据与 epoch 日志均 sync）。
     pub fn write(&mut self, x: i32, z: i32, type_id: u16, nbt: &[u8]) -> Result<(), StrataError> {
         let (compressed, comp_id) = self.compress_payload(type_id, nbt)?;
         self.append_compressed(x, z, type_id, compressed, comp_id)
@@ -319,11 +395,14 @@ impl Store {
         Ok((compressed, comp_id))
     }
 
-    /// 已压缩记录的落盘子路径：gen 分配 → 段追加 → epoch 日志 → 内存索引 →
-    /// 段表记账 → 段滚动 → 冷区失效 → 缓冲落盘。
+    /// 已压缩记录的落盘子路径：gen 分配 → 段追加（WAL：数据先持久化）→
+    /// epoch 日志（flush+sync）→ 内存索引 → 段表记账 → 段滚动 → 冷区失效。
     ///
     /// [`Store::write`] 与 [`Store::write_batch`] 共用此路径，保证单条与批量
     /// 写入语义完全一致（同一条 gen/段/epoch/索引链路）。
+    ///
+    /// 代价说明：每条记录一次段文件 `sync_data` + 一次日志 `sync_all`，
+    /// 这是"返回即持久"的价格。
     fn append_compressed(
         &mut self,
         x: i32,
@@ -336,20 +415,11 @@ impl Store {
         let gen = self.manifest.next_gen;
         self.manifest.next_gen += 1;
 
-        // 2. 活跃段按需创建。
+        // 2. 活跃段按需创建（alloc 内部：文件头落盘 → manifest 登记）。
         if self.writer.is_none() {
-            let id = self.alloc_segment(Bucket::Young)?;
-            let path = seg_path(&self.root, id);
-            let w = SegmentWriter::create(&path, id)?;
+            let (id, w) = self.alloc_segment(Bucket::Young)?;
             self.writer = Some(w);
             self.active_seg = id;
-        }
-        // region 位图快照占位（缺则补零页）。
-        let rk = RegionKey { x: x >> 5, z: z >> 5 };
-        if !self.manifest.region_bitmaps.iter().any(|(k, _)| *k == rk) {
-            self.manifest
-                .region_bitmaps
-                .push((rk, vec![0u8; REGION_BITMAP_BYTES]));
         }
 
         // 3. 信封。
@@ -365,15 +435,24 @@ impl Store {
             payload_hash: xxh64(&compressed, 0),
         };
 
-        // 4. 追加段文件。
+        // 4. 追加段文件并持久化数据——日志不得先于数据。
         let seg_id = self.active_seg;
-        let offset = self
-            .writer
-            .as_mut()
-            .expect("writer ensured above")
-            .append(&env, &compressed)?;
+        let writer = self.writer.as_mut().expect("writer ensured above");
+        let offset = match writer.append(&env, &compressed) {
+            Ok(o) => o,
+            Err(e) => {
+                // 写入器已做部分写恢复；丢弃它，下次写入开新段。
+                // 该记录未进日志/索引，不可见，段内前缀完好。
+                self.writer = None;
+                return Err(e);
+            }
+        };
+        if let Err(e) = writer.sync_data() {
+            self.writer = None;
+            return Err(e);
+        }
 
-        // 5. epoch 日志。
+        // 5. epoch 日志（record 内部 flush+sync；数据已在盘上，回放不悬空）。
         self.epoch.record(&EpochEntry {
             seg_id,
             env: env.clone(),
@@ -415,11 +494,6 @@ impl Store {
         // 9. 冷区失效：覆盖已晋升 region 的键时，归档槽位作废并记账。
         self.invalidate_cold_slot(x, z, type_id)?;
 
-        // 10. 缓冲落盘：保证同会话内 read() 能读到刚写入的记录。
-        if let Some(w) = self.writer.as_mut() {
-            w.flush_buf()?;
-        }
-
         Ok(())
     }
 
@@ -430,17 +504,30 @@ impl Store {
     /// `0`（全部可用核心）/`N ≥ 2` 在 [`std::thread::scope`] 内派生有界
     /// worker 线程分块压缩——不用 rayon 全局池，避免与游戏线程抢核且可按
     /// Store 配置限流。随后串行循环走 [`Store::append_compressed`]，每条记录
-    /// 与 [`Store::write`] 共享同一条 gen/段/epoch/索引链路。任一 worker
-    /// 出错即终止整批。空批量不做任何 IO，返回 `written = 0`。
+    /// 与 [`Store::write`] 共享同一条 gen/段/epoch/索引链路。
+    ///
+    /// **前缀提交语义**：记录逐条持久化，任一失败不回滚已提交部分，错误为
+    /// [`StrataError::BatchPartial`]（`committed` = 已提交条数）。调用方重试
+    /// 时应跳过前 `committed` 条。空批量不做任何 IO，返回 `written = 0`。
     pub fn write_batch(&mut self, items: &[BatchItem]) -> Result<BatchWriteResult, StrataError> {
         if items.is_empty() {
             return Ok(BatchWriteResult { written: 0 });
         }
 
-        let compressed = self.compress_batch(items)?;
+        let compressed = self.compress_batch(items).map_err(|e| StrataError::BatchPartial {
+            committed: 0,
+            source: Box::new(e),
+        })?;
 
+        let mut committed = 0u64;
         for (item, (bytes, comp_id)) in items.iter().zip(compressed) {
-            self.append_compressed(item.x, item.z, item.type_id, bytes, comp_id)?;
+            if let Err(e) = self.append_compressed(item.x, item.z, item.type_id, bytes, comp_id) {
+                return Err(StrataError::BatchPartial {
+                    committed,
+                    source: Box::new(e),
+                });
+            }
+            committed += 1;
         }
 
         Ok(BatchWriteResult {
@@ -539,27 +626,10 @@ impl Store {
                     x: x >> 5,
                     z: z >> 5,
                 };
-                if self
-                    .manifest
-                    .cold
-                    .iter()
-                    .any(|c| c.region_x == rk.x && c.region_z == rk.z)
-                {
-                    let path = cold_path(&self.root, rk.x, rk.z);
-                    // 并发读（SyncStore 读锁下多线程）可能同时到达此处：
-                    // 借不到共享 reader 时开一个本次调用私有的，绝不 panic。
-                    match self.cold_readers.try_borrow_mut() {
-                        Ok(mut readers) => {
-                            if !readers.contains_key(&rk) {
-                                readers.insert(rk.clone(), ArchiveReader::open(&path)?);
-                            }
-                            let reader = readers.get_mut(&rk).expect("inserted above");
-                            let res = reader.get(x, z, type_id);
-                            drop(readers);
-                            return res;
-                        }
-                        Err(_) => return ArchiveReader::open(&path)?.get(x, z, type_id),
-                    }
+                if self.cold_lookup.contains_key(&rk) {
+                    // 外层 map 锁内取走 Arc 即放锁；归档本体锁内完成读取。
+                    let reader = self.cold_reader(&rk)?;
+                    return reader.lock().unwrap_or_poisoned().get(x, z, type_id);
                 }
                 return Ok(None);
             }
@@ -611,7 +681,8 @@ impl Store {
                 continue;
             }
             // 旧页：优先缓存，回落磁盘。
-            let old = match self.cache.get(id) {
+            let cached = self.cache.lock().unwrap_or_poisoned().get(id);
+            let old = match cached {
                 Some(p) => p,
                 None => self
                     .load_page(id)?
@@ -622,21 +693,10 @@ impl Store {
                 let st = self.segs.get_mut(&id).expect("iterated from segs");
                 entries.append(&mut st.incremental);
             }
-            // from_entries 排序并对同键保留最大 gen。
+            // from_entries 排序并对同键保留最大 gen；覆盖式 rename 原子替换。
             let page = Arc::new(IndexPage::from_entries(entries));
-            let bytes = page.serialize();
-
-            let final_path = ix_path(&self.root, id);
-            let tmp_path = final_path.with_extension("vix.tmp");
-            let mut f = File::create(&tmp_path)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-            // Windows rename 到已存在目标会失败，先清旧文件。
-            if final_path.exists() {
-                std::fs::remove_file(&final_path)?;
-            }
-            std::fs::rename(&tmp_path, &final_path)?;
-            self.cache.put(id, page);
+            write_index_page(&self.root, id, &page)?;
+            self.cache.lock().unwrap_or_poisoned().put(id, page);
         }
 
         // 以全局最新视图重算每段 live_bytes（覆盖写入不减少 live 的暂态记账）。
@@ -736,9 +796,26 @@ impl Store {
         Ok(report)
     }
 
-    /// 分配新段号：段表 + SegState 落位（不创建文件、不动活跃写入器）。
-    pub(crate) fn alloc_segment(&mut self, bucket: Bucket) -> Result<u32, StrataError> {
+    /// 分配新段：段文件创建（头落盘）→ manifest 立即登记并保存 → 返回写入器。
+    ///
+    /// 崩溃任何时刻都不会留下"epoch 条目引用 manifest 不认识的段"的洞：
+    /// 登记紧随文件持久化。同名残留孤儿文件（上次崩溃在旧代码"创建后未登记"
+    /// 窗口留下）必然不可达——可达段都已被回放/rebuild 认领——直接删除重建。
+    pub(crate) fn alloc_segment(
+        &mut self,
+        bucket: Bucket,
+    ) -> Result<(u32, SegmentWriter), StrataError> {
         let id = self.manifest.next_seg_id;
+        let path = seg_path(&self.root, id);
+        if path.exists() {
+            remove_file_with_retry(&path).map_err(|e| {
+                StrataError::Manifest(format!("删除孤儿段文件 `{}` 失败: {e}", path.display()))
+            })?;
+        }
+        let mut w = SegmentWriter::create(&path, id)?;
+        // 文件头先持久化，再登记：盘上 manifest 永远认识已创建的段。
+        w.fsync()?;
+
         self.manifest.next_seg_id += 1;
         let epoch = self.manifest.epoch;
         self.manifest.segments.push(SegmentMeta {
@@ -750,13 +827,20 @@ impl Store {
             last_rewrite_epoch: epoch,
         });
         self.segs.insert(id, SegState::new());
-        Ok(id)
+        self.manifest.save(&self.root)?;
+        Ok((id, w))
     }
 
-    /// 删除一个段：数据文件 + 索引页 + 内存状态 + 段表 + 缓存。
+    /// 删除一个段：先除名并持久化 manifest，然后才删文件（含索引页）。
     ///
-    /// 文件删除带重试：Windows 上杀软/索引器可能短暂锁定文件。
+    /// 崩溃在文件删除中途也不会留下"manifest 引用已删段"的悬空；残留文件
+    /// 会在下次 `alloc_segment` 撞号时按孤儿接管，或被 rebuild 路径清理。
     pub(crate) fn remove_segment(&mut self, seg_id: u32) -> Result<(), StrataError> {
+        self.segs.remove(&seg_id);
+        self.manifest.segments.retain(|m| m.id != seg_id);
+        self.manifest.save(&self.root)?;
+        self.cache.lock().unwrap_or_poisoned().evict(seg_id);
+
         let p = seg_path(&self.root, seg_id);
         if p.exists() {
             remove_file_with_retry(&p).map_err(|e| {
@@ -769,16 +853,24 @@ impl Store {
                 StrataError::Manifest(format!("删除段索引 `{}` 失败: {e}", ix.display()))
             })?;
         }
-        self.segs.remove(&seg_id);
-        self.manifest.segments.retain(|m| m.id != seg_id);
-        self.cache.evict(seg_id);
         Ok(())
     }
 
-    /// 读磁盘索引页（不存在 → `None`）。`read`/`latest_index` 是 `&self`，不走缓存。
+    /// 读磁盘索引页：缓存优先（SIEVE），未命中读盘后回填缓存。
+    /// 不存在 → `None`。`&self` 读路径可并发（缓存在 `Mutex` 后）。
     pub(crate) fn load_page(&self, seg_id: u32) -> Result<Option<Arc<IndexPage>>, StrataError> {
+        if let Some(p) = self.cache.lock().unwrap_or_poisoned().get(seg_id) {
+            return Ok(Some(p));
+        }
         match std::fs::read(ix_path(&self.root, seg_id)) {
-            Ok(bytes) => Ok(Some(Arc::new(IndexPage::deserialize(&bytes)?))),
+            Ok(bytes) => {
+                let page = Arc::new(IndexPage::deserialize(&bytes)?);
+                self.cache
+                    .lock()
+                    .unwrap_or_poisoned()
+                    .put(seg_id, Arc::clone(&page));
+                Ok(Some(page))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(StrataError::Io(e)),
         }
@@ -789,7 +881,8 @@ impl Store {
         let ids: Vec<u32> = self.manifest.segments.iter().map(|m| m.id).collect();
         let mut latest: HashMap<IndexKey, IndexVal> = HashMap::new();
         for id in ids {
-            let page = match self.cache.get(id) {
+            let cached = self.cache.lock().unwrap_or_poisoned().get(id);
+            let page = match cached {
                 Some(p) => p,
                 None => match self.load_page(id)? {
                     Some(p) => p,
@@ -819,45 +912,161 @@ impl Store {
     /// 若 `(x, z, type_id)` 所在 region 已有冷归档，失效其槽位并在 manifest 记账。
     ///
     /// `write` 收尾调用：热层新写覆盖冷槽后，冷副本不再是最新版本。
+    ///
+    /// demote 回写期间（[`Store::demote_in_progress`]）抑制：此时冷区即将
+    /// 除名，若照常吃失效记账，崩溃在"回写已进日志、manifest 未除名"窗口时
+    /// 回放会跳过冷区键（回写丢失）而槽位已失效——两个副本同时蒸发。
     pub(crate) fn invalidate_cold_slot(
         &mut self,
         x: i32,
         z: i32,
         type_id: u16,
     ) -> Result<(), StrataError> {
+        if self.demote_in_progress {
+            return Ok(());
+        }
         let rk = RegionKey {
             x: x >> 5,
             z: z >> 5,
         };
-        if !self
-            .manifest
-            .cold
-            .iter()
-            .any(|c| c.region_x == rk.x && c.region_z == rk.z)
-        {
+        let Some(&idx) = self.cold_lookup.get(&rk) else {
             return Ok(());
-        }
-        let path = cold_path(&self.root, rk.x, rk.z);
-        let first = {
-            let mut readers = self.cold_readers.borrow_mut();
-            if !readers.contains_key(&rk) {
-                readers.insert(rk.clone(), ArchiveReader::open(&path)?);
-            }
-            let reader = readers.get_mut(&rk).expect("inserted above");
-            reader.invalidate(x, z, type_id)?
         };
+        let reader = self.cold_reader(&rk)?;
+        let first = reader.lock().unwrap_or_poisoned().invalidate(x, z, type_id)?;
         if first {
-            if let Some(c) = self
-                .manifest
-                .cold
-                .iter_mut()
-                .find(|c| c.region_x == rk.x && c.region_z == rk.z)
-            {
+            if let Some(c) = self.manifest.cold.get_mut(idx) {
                 c.invalid_count += 1;
             }
         }
         Ok(())
     }
+
+    /// 懒加载冷归档读取器（外层 map 锁内只做查表/插入，取走 `Arc` 即放锁）。
+    pub(crate) fn cold_reader(
+        &self,
+        rk: &RegionKey,
+    ) -> Result<Arc<Mutex<ArchiveReader>>, StrataError> {
+        let mut readers = self.cold_readers.lock().unwrap_or_poisoned();
+        if let Some(r) = readers.get(rk) {
+            return Ok(Arc::clone(r));
+        }
+        let path = cold_path(&self.root, rk.x, rk.z);
+        let reader = Arc::new(Mutex::new(ArchiveReader::open(&path)?));
+        readers.insert(rk.clone(), Arc::clone(&reader));
+        Ok(reader)
+    }
+
+    /// 由 `manifest.cold` 重建 [`Store::cold_lookup`]（cold 增删后调用）。
+    pub(crate) fn rebuild_cold_lookup(&mut self) {
+        self.cold_lookup = self
+            .manifest
+            .cold
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (RegionKey { x: c.region_x, z: c.region_z }, i))
+            .collect();
+    }
+
+    /// epoch 回放认领孤儿段：manifest 不认识 `seg_id` 但段文件存在且段头
+    /// 有效 → 按段头登记进段表。返回是否认领成功（文件缺失/头坏 → false，
+    /// 调用方丢弃对应条目）。
+    fn claim_segment(&mut self, seg_id: u32) -> Result<bool, StrataError> {
+        let path = seg_path(&self.root, seg_id);
+        if !segment_header_ok(&path, seg_id) {
+            return Ok(false);
+        }
+        let epoch = self.manifest.epoch;
+        self.manifest.segments.push(SegmentMeta {
+            id: seg_id,
+            live_bytes: 0,
+            total_bytes: 0,
+            bucket: Bucket::Young,
+            created_epoch: epoch,
+            last_rewrite_epoch: epoch,
+        });
+        self.segs.insert(seg_id, SegState::new());
+        if seg_id >= self.manifest.next_seg_id {
+            self.manifest.next_seg_id = seg_id + 1;
+        }
+        Ok(true)
+    }
+
+    /// 冷区对账（open 时调用，先于 epoch 回放）：
+    /// - 未登记但可解析的 `.varc` → 重新注册（晋升在"文件落盘→登记"之间
+    ///   崩溃时文件先于登记存在；读路径热层最新优先，重注册不遮蔽新写）；
+    /// - 未登记且不可解析的半截 `.varc` → 删除（写归档中途崩溃的残留，
+    ///   此时热层尚未 purge，数据在热层完整）；
+    /// - 已登记但文件缺失 → 除名。
+    /// 返回 manifest 是否被修改。
+    fn reconcile_cold(&mut self) -> Result<bool, StrataError> {
+        let mut dirty = false;
+        let dir = self.root.join(COLD_DIR);
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Some(rest) = name.strip_suffix(".varc") else {
+                    continue;
+                };
+                let Some(rest) = rest.strip_prefix("r.") else {
+                    continue;
+                };
+                let Some((xs, zs)) = rest.split_once('.') else {
+                    continue;
+                };
+                let (Ok(rx), Ok(rz)) = (xs.parse::<i32>(), zs.parse::<i32>()) else {
+                    continue;
+                };
+                let rk = RegionKey { x: rx, z: rz };
+                if self.cold_lookup.contains_key(&rk) {
+                    continue;
+                }
+                match ArchiveReader::open(&entry.path()) {
+                    Ok(r) => {
+                        self.manifest.cold.push(ColdMeta {
+                            region_x: rx,
+                            region_z: rz,
+                            invalid_count: r.invalid_count(),
+                            total_slots: r.total_slots(),
+                        });
+                        self.cold_lookup
+                            .insert(rk, self.manifest.cold.len() - 1);
+                        dirty = true;
+                    }
+                    Err(_) => {
+                        let inv = entry.path().with_extension("varc.inv");
+                        let _ = remove_file_with_retry(&entry.path());
+                        if inv.exists() {
+                            let _ = remove_file_with_retry(&inv);
+                        }
+                    }
+                }
+            }
+        }
+
+        let before = self.manifest.cold.len();
+        self.manifest
+            .cold
+            .retain(|c| cold_path(&self.root, c.region_x, c.region_z).exists());
+        if self.manifest.cold.len() != before {
+            dirty = true;
+        }
+        self.rebuild_cold_lookup();
+        Ok(dirty)
+    }
+}
+
+/// 段磁盘索引页原子落盘：tmp + fsync + 覆盖式 rename（不预删旧文件，
+/// 杜绝"旧页已删、新页未就位"的崩溃窗口；rename 失败才走删除+重试兜底）。
+pub(crate) fn write_index_page(root: &Path, seg_id: u32, page: &IndexPage) -> Result<(), StrataError> {
+    let final_path = ix_path(root, seg_id);
+    let tmp_path = final_path.with_extension("vix.tmp");
+    let bytes = page.serialize();
+    let mut f = File::create(&tmp_path)?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
+    rename_replace(&tmp_path, &final_path)
 }
 
 #[cfg(test)]

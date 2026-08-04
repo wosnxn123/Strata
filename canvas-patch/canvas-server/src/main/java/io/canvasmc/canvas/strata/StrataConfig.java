@@ -21,7 +21,6 @@ import java.util.Properties;
  * strata.compression.cold=zstd-9
  * strata.compression.hot-enabled=true
  * strata.compression.cold-enabled=true
- * strata.compression.dictionary=true
  * strata.compression.threads=1             # batch compression workers (default serial)
  * strata.index.cache-mb=512
  * strata.tiering.enabled=true
@@ -31,6 +30,7 @@ import java.util.Properties;
  * strata.gc.invalid-threshold=0.6
  * strata.gc.budget-bytes=33554432
  * strata.gc.min-hole-bytes=65536
+ * strata.force-anvil=false                 # emergency escape: boot on Anvil although a vstore exists
  * </pre>
  * An explicit {@code strata.enabled=false} short-circuits parsing exactly
  * like the CLI. Unknown keys are reported as warnings, never fatal.
@@ -55,6 +55,7 @@ public final class StrataConfig {
     public boolean tieringEnabled = true;
     public int tieringStableFlushes = 30;
     public double tieringDemoteRatio = 0.25;
+    public boolean forceAnvil = false;
 
     public final List<String> warnings = new ArrayList<>();
 
@@ -94,6 +95,9 @@ public final class StrataConfig {
         final String enabledRaw = trimToNull(properties.getProperty("strata.enabled"));
         if ("false".equalsIgnoreCase(enabledRaw)) {
             config.enabled = false;
+            // parse the escape hatch before short-circuiting: a disabled store
+            // with an existing vstore still needs to know about force-anvil
+            config.forceAnvil = parseBool(config, file, "strata.force-anvil", trimToNull(properties.getProperty("strata.force-anvil")), false);
             return config;
         }
         config.enabled = "true".equalsIgnoreCase(enabledRaw);
@@ -106,7 +110,7 @@ public final class StrataConfig {
                 case "strata.compression.cold" -> applyCodec(config, file, key, value, false);
                 case "strata.compression.hot-enabled" -> config.hotEnabled = parseBool(config, file, key, value, true);
                 case "strata.compression.cold-enabled" -> config.coldEnabled = parseBool(config, file, key, value, true);
-                case "strata.compression.dictionary" -> config.dictionary = parseBool(config, file, key, value, true);
+                case "strata.compression.dictionary" -> config.warnings.add(file.getFileName() + ": strata.compression.dictionary 已停用，忽略 (retired key, ignored)");
                 case "strata.compression.threads" -> config.compressionThreads = (int) parseLong(config, file, key, value, config.compressionThreads);
                 case "strata.index.cache-mb" -> config.cacheMb = parseLong(config, file, key, value, config.cacheMb);
                 case "strata.gc.enabled" -> config.gcEnabled = parseBool(config, file, key, value, true);
@@ -116,6 +120,7 @@ public final class StrataConfig {
                 case "strata.tiering.enabled" -> config.tieringEnabled = parseBool(config, file, key, value, true);
                 case "strata.tiering.stable-flushes" -> config.tieringStableFlushes = (int) parseLong(config, file, key, value, config.tieringStableFlushes);
                 case "strata.tiering.invalid-demote-ratio" -> config.tieringDemoteRatio = parseDouble(config, file, key, value, config.tieringDemoteRatio);
+                case "strata.force-anvil" -> config.forceAnvil = parseBool(config, file, key, value, false);
                 default -> config.warnings.add(file.getFileName() + ": ignoring unknown key '" + key + "'");
             }
         }
@@ -209,7 +214,6 @@ public final class StrataConfig {
         strata.compression.cold-enabled=true
         strata.compression.hot=zstd-3
         strata.compression.cold=zstd-9
-        strata.compression.dictionary=true
         # Batch compression workers: 0=auto(all cores) 1=serial(default, TPS-first) N>=2=capped
         # 批量压缩线程：0=自动(全核) 1=串行(默认,TPS优先) N≥2=限N线程
         strata.compression.threads=1
@@ -219,5 +223,10 @@ public final class StrataConfig {
         strata.gc.enabled=true
         strata.gc.invalid-threshold=0.6
         strata.gc.budget-bytes=33554432
+        # Minimum hole bytes for punch / 挖洞最小洞阈值（字节）
+        strata.gc.min-hole-bytes=65536
+        # Emergency escape: boot on Anvil even when a vstore exists (data in vstore invisible until converted back)
+        # 应急逃生门：vstore 存在时仍按 Anvil 启动（vstore 内数据在转回前不可见）
+        strata.force-anvil=false
         """;
 }

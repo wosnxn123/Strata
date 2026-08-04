@@ -22,17 +22,17 @@ public final class StrataStartup {
     private StrataStartup() {
     }
 
-    public static void runConversion(final Path worldDir, final boolean toStrata) {
-        LOGGER.info("Strata startup conversion requested ({} -> {}) for {}",
-            toStrata ? "Anvil" : "vstore", toStrata ? "vstore" : "Anvil", worldDir);
+    public static void runConversion(final Path worldDir, final boolean toStrata, final boolean force) {
+        LOGGER.info("Strata startup conversion requested ({} -> {}) for {}{}",
+            toStrata ? "Anvil" : "vstore", toStrata ? "vstore" : "Anvil", worldDir, force ? " [force]" : "");
         final StrataConfig config = StrataConfig.load(worldDir, true);
         for (final String warning : config.warnings) {
             LOGGER.warn("Strata config: {}", warning);
         }
         try {
             final StrataConverter.Report report = toStrata
-                ? StrataConverter.convertToStrata(worldDir, config)
-                : StrataConverter.convertToAnvil(worldDir, config);
+                ? StrataConverter.convertToStrata(worldDir, config, force)
+                : StrataConverter.convertToAnvil(worldDir, config, force);
             if (toStrata) {
                 LOGGER.info("Converted {} regions ({} records) to {}", report.regions(), report.records(), worldDir.resolve("vstore"));
                 LOGGER.info("Anvil sources retained in region/, entities/, poi/ — verify the world, then delete them manually.");
@@ -42,8 +42,8 @@ public final class StrataStartup {
                 }
                 LOGGER.info("Remove the --strataConvertToStrata flag before the next start, or the vstore will be rebuilt again.");
             } else {
-                LOGGER.info("Converted {} regions ({} records) back to Anvil ({} records kept from existing Anvil)",
-                    report.regions(), report.records(), report.skipped());
+                LOGGER.info("Converted {} regions ({} records) back to Anvil ({} records kept from existing Anvil{})",
+                    report.regions(), report.records(), report.skipped(), report.legacyRaw() > 0 ? ", " + report.legacyRaw() + " legacy raw records" : "");
                 LOGGER.info("vstore retained at {} — verify the world, then delete it manually.", worldDir.resolve("vstore"));
                 LOGGER.info("Remove the --strataConvertToAnvil flag before the next start, or the region files will be rewritten again.");
             }

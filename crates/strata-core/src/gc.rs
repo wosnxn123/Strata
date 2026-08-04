@@ -1,21 +1,32 @@
 //! 三档 GC：整段删除 → hole-punch → 打分压实。
 //!
-//! 以 [`Store::latest_index`]（每键最大 gen 的全局视图）为唯一死活判据：
-//! 段内扫描记录若与 latest 索引指向不符，即为死记录。
+//! 以 [`Store::latest_index`]（每键最大 gen 的全局视图）为死活判据，段内
+//! 扫描记录三分类：
+//! - latest 指向它且负载哈希有效 → **存活**；
+//! - latest 指向它但 `payload_hash == 0` → **损坏的最新记录**
+//!   （live-but-unreadable）：不参与挖洞/整段删除/压实，避免销毁唯一副本；
+//! - 其余（被更高 gen 遮蔽或无索引）→ **死记录**，可回收。
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
+use std::sync::Arc;
 
 use crate::envelope::ENVELOPE_SIZE;
-use crate::index::{IndexKey, IndexVal};
+use crate::index::{IndexKey, IndexPage, IndexVal};
 use crate::manifest::Bucket;
 use crate::punch::{punch_hole, PunchOutcome};
-use crate::segment::{scan_segment, ScannedRecord, SegmentWriter};
-use crate::store::{seg_path, Store};
+use crate::segment::{scan_segment, ScannedRecord};
+use crate::store::{ix_path, remove_file_with_retry, seg_path, write_index_page, MutexExt, Store};
 use crate::StrataError;
 
 /// 分桶晋升阈值：Young → Active 所需的 flush 次数。
 const ACTIVE_AFTER_FLUSHES: u64 = 2;
+
+/// 单次挖洞子区间长度上限。挖洞本身只碰负载、保留信封壳（扫描安全不变量
+/// 见档位 2 注释）；≤32KB 的子区间是纵深防御：一旦壳也损坏迫使扫描器走
+/// 重同步路径，64KB 窗口（`segment::RESYNC_WINDOW`）内必有下一个洞边界外
+/// 的有效记录可供找回，同时契合 Linux 块对齐收缩的粒度。
+const PUNCH_MAX_CHUNK: u64 = 32 * 1024;
 
 /// GC 配置。
 #[derive(Debug, Clone)]
@@ -138,8 +149,11 @@ impl Store {
             let mut total = 0u64;
             let mut dead = 0u64;
             let mut live_count = 0usize;
+            let mut corrupt_latest = 0usize;
             let mut live_records: Vec<ScannedRecord> = Vec::new();
             let mut spans: Vec<(u64, u64)> = Vec::new(); // 死记录 [start, end)
+            // 死记录负载区间（不含信封壳）：挖洞只碰负载，壳永远保留。
+            let mut dead_payloads: Vec<(u64, u64)> = Vec::new();
 
             for rec in &scan.records {
                 let rec_bytes = ENVELOPE_SIZE as u64 + rec.env.payload_len as u64;
@@ -149,30 +163,33 @@ impl Store {
                     z: rec.env.chunk_z,
                     type_id: rec.env.type_id,
                 };
-                let live = match latest.get(&key) {
-                    Some(v) => {
-                        v.seg_id == id
-                            && v.offset == rec.offset
-                            && v.gen == rec.env.gen
-                            && rec.env.payload_hash != 0
-                    }
-                    None => false,
-                };
-                if live {
+                let is_latest = matches!(latest.get(&key),
+                    Some(v) if v.seg_id == id && v.offset == rec.offset && v.gen == rec.env.gen);
+                if is_latest && rec.env.payload_hash != 0 {
                     live_count += 1;
                     live_records.push(ScannedRecord {
                         env: rec.env.clone(),
                         offset: rec.offset,
                         payload: rec.payload.clone(),
                     });
+                } else if is_latest {
+                    // 损坏的最新记录：唯一副本不可读但绝不销毁，也不得
+                    // 计入死字节（它的区间不参与任何回收动作）。
+                    corrupt_latest += 1;
                 } else {
                     dead += rec_bytes;
                     spans.push((rec.offset, rec.offset + rec_bytes));
+                    if rec.env.payload_len > 0 {
+                        dead_payloads.push((
+                            rec.offset + ENVELOPE_SIZE as u64,
+                            rec.offset + rec_bytes,
+                        ));
+                    }
                 }
             }
 
-            // —— 档位 1：整段删除 ——
-            if live_count == 0 {
+            // —— 档位 1：整段删除（无存活且无损坏最新才可删）——
+            if live_count == 0 && corrupt_latest == 0 {
                 self.remove_segment(id)?;
                 stats.reclaimed_bytes += total;
                 stats.segments_removed += 1;
@@ -191,30 +208,57 @@ impl Store {
                 continue;
             }
 
-            // —— 档位 2：hole-punch 连续死区间 ——
+            // —— 档位 2：hole-punch 死记录负载 ——
+            //
+            // 扫描安全不变量：**只挖负载、保留全部 40B 信封壳**（含段内最后
+            // 一条记录的壳——"尾洞变体"）。扫描器沿保留的壳正常行走：归零的
+            // 负载只会在哈希校验处被标记损坏，绝不会进入"零头→MAGIC 重同步"
+            // 路径，因此任意长度的死区间挖洞后段仍可扫描/verify/rebuild。
+            // 若连壳挖掉，>64KB（重同步窗口）的洞会让扫描器永久丢失同步。
+            //
+            // 每段负载区间再切 ≤32KB 子区间逐次调用 punch（PUNCH_MAX_CHUNK：
+            // 在 64KB 重同步窗口内留足余量，也契合 Linux 块对齐收缩的粒度）。
             spans.sort_unstable();
             let merged = merge_spans(&spans);
+            // 可挖区间 = 达到 min_hole_bytes 门槛的合并死区间。
+            let eligible: Vec<(u64, u64)> = merged
+                .into_iter()
+                .filter(|&(s, e)| e - s >= cfg.min_hole_bytes)
+                .collect();
             let mut remaining_dead = dead;
             let mut punched = 0u64;
-            for (start, end) in merged {
-                let len = end - start;
-                if len < cfg.min_hole_bytes {
-                    continue;
-                }
+            if !eligible.is_empty() {
                 let mut f = OpenOptions::new().read(true).write(true).open(&path)?;
-                match punch_hole(&mut f, start, len)? {
-                    PunchOutcome::Done => {
-                        stats.holes_punched += 1;
-                        stats.reclaimed_bytes += len;
-                        punched += len;
-                        remaining_dead -= len.min(remaining_dead);
+                for &(pay_start, pay_end) in &dead_payloads {
+                    // 仅挖落在合格合并区间内的死记录（壳在区间计数里但永不挖）。
+                    let rec_off = pay_start - ENVELOPE_SIZE as u64;
+                    if !eligible.iter().any(|&(s, e)| rec_off >= s && rec_off < e) {
+                        continue;
                     }
-                    PunchOutcome::Unsupported => {}
+                    let mut off = pay_start;
+                    while off < pay_end {
+                        let len = (pay_end - off).min(PUNCH_MAX_CHUNK);
+                        match punch_hole(&mut f, off, len)? {
+                            PunchOutcome::Done => {
+                                stats.holes_punched += 1;
+                                stats.reclaimed_bytes += len;
+                                punched += len;
+                                remaining_dead = remaining_dead.saturating_sub(len);
+                            }
+                            PunchOutcome::Unsupported => {}
+                        }
+                        off += len;
+                    }
                 }
             }
 
-            // —— 档位 3 候选：仅当 punch 未消化全部死字节 ——
+            // —— 档位 3 候选：punch 未消化全部死字节，且段内无损坏最新记录 ——
             if remaining_dead == 0 {
+                continue;
+            }
+            if corrupt_latest > 0 {
+                // 压实 = 搬迁存活记录后删除旧段；不可读的损坏记录搬不走，
+                // 删除旧段等于销毁唯一副本。留给 verify 报告人工处置。
                 continue;
             }
             let age = self.manifest.epoch.saturating_sub(seg_created).max(1);
@@ -245,16 +289,7 @@ impl Store {
             if moved_bytes.saturating_add(cand.live_bytes) > cfg.budget_bytes {
                 continue;
             }
-            let (new_id, moved) = compact_segment(self, cand.id, cand.live_records)?;
-            // 搬迁后回写判据：被搬记录的最新指向改为新段。
-            let entries: Vec<(IndexKey, IndexVal)> = self
-                .segs
-                .get(&new_id)
-                .map(|st| st.incremental.clone())
-                .unwrap_or_default();
-            for (k, v) in entries {
-                latest.insert(k, v);
-            }
+            let (_, moved) = compact_segment(self, cand.id, cand.live_records, &mut latest)?;
             // 净回收 = 删除的旧段 - 搬进新段的存活字节（扣除已记账的挖洞）。
             stats.reclaimed_bytes += cand
                 .old_total
@@ -292,15 +327,22 @@ fn merge_spans(spans: &[(u64, u64)]) -> Vec<(u64, u64)> {
     out
 }
 
-/// 档位 3 压实：把旧段的存活记录原样搬进新段，然后删除旧段。
+/// 档位 3 压实：把旧段的存活记录原样搬进新段并删除旧段。
 ///
-/// 搬迁不改动信封任何字段（decode 出的原样 encode 回去）；新段
-/// `SegmentMeta` 的 live/total 为搬迁字节和，`last_rewrite_epoch` 取当前 epoch。
-/// 返回 `(新段 id, 搬迁记录数)`。
+/// 持久化顺序（崩溃在任何一点都不丢数据）：
+/// 1. `alloc_segment`：新段文件创建 + fsync + manifest 登记保存；
+/// 2. 搬迁记录追加进新段 + fsync 段数据；
+/// 3. 新段 `.vix` 索引页落盘（tmp + fsync + 覆盖 rename）；
+/// 4. `manifest.save`：新段记账、旧段除名；
+/// 5. 删除旧段文件与索引页。
+///
+/// 搬迁记录不再依赖后续 flush 才有索引：第 3 步已持久化 `.vix`，
+/// 因此也不写入新段的 `incremental`。搬迁不改动信封任何字段。
 fn compact_segment(
     store: &mut Store,
     old_id: u32,
     live: Vec<ScannedRecord>,
+    latest: &mut HashMap<IndexKey, IndexVal>,
 ) -> Result<(u32, u64), StrataError> {
     let bucket = store
         .manifest
@@ -310,46 +352,69 @@ fn compact_segment(
         .map(|m| m.bucket)
         .unwrap_or(Bucket::Young);
 
-    let new_id = store.alloc_segment(bucket)?;
-    let path = seg_path(&store.root, new_id);
-    let mut w = SegmentWriter::create(&path, new_id)?;
+    // 1. 新段（alloc 内部已：文件头落盘 → manifest 登记保存）。
+    let (new_id, mut w) = store.alloc_segment(bucket)?;
 
+    // 2. 搬迁。
+    let mut entries: Vec<(IndexKey, IndexVal)> = Vec::with_capacity(live.len());
     let mut moved_bytes = 0u64;
     let mut moved = 0u64;
     for rec in live {
         let offset = w.append(&rec.env, &rec.payload)?;
-        let st = store
-            .segs
-            .get_mut(&new_id)
-            .expect("alloc_segment inserted state");
         let key = IndexKey {
             x: rec.env.chunk_x,
             z: rec.env.chunk_z,
             type_id: rec.env.type_id,
         };
+        let st = store
+            .segs
+            .get_mut(&new_id)
+            .expect("alloc_segment inserted state");
         st.bitmap.set(key.x, key.z, key.type_id);
-        st.incremental.push((
-            key,
-            IndexVal {
-                seg_id: new_id,
-                offset,
-                payload_len: rec.env.payload_len,
-                gen: rec.env.gen,
-                comp_id: rec.env.comp_id,
-            },
-        ));
+        let val = IndexVal {
+            seg_id: new_id,
+            offset,
+            payload_len: rec.env.payload_len,
+            gen: rec.env.gen,
+            comp_id: rec.env.comp_id,
+        };
+        latest.insert(key.clone(), val);
+        entries.push((key, val));
         moved_bytes += ENVELOPE_SIZE as u64 + rec.env.payload_len as u64;
         moved += 1;
     }
     w.fsync()?;
     w.close()?;
 
+    // 3. 新段索引页持久化（此刻崩溃：新段已登记但索引为空 → 搬迁记录不可见，
+    //    旧段完好无损，下轮 GC 会把新段当全死段回收）。
+    let page = Arc::new(IndexPage::from_entries(entries));
+    write_index_page(&store.root, new_id, &page)?;
+    store.cache.lock().unwrap_or_poisoned().put(new_id, page);
+
+    // 4. manifest：新段记账 + 旧段除名，持久化后才可删旧。
     if let Some(m) = store.manifest.segments.iter_mut().find(|m| m.id == new_id) {
         m.live_bytes = moved_bytes;
         m.total_bytes = moved_bytes;
         m.last_rewrite_epoch = store.manifest.epoch;
     }
+    store.manifest.segments.retain(|m| m.id != old_id);
+    store.manifest.save(&store.root)?;
 
-    store.remove_segment(old_id)?;
+    // 5. 替代物已全部持久化：删除旧段。
+    store.segs.remove(&old_id);
+    store.cache.lock().unwrap_or_poisoned().evict(old_id);
+    let p = seg_path(&store.root, old_id);
+    if p.exists() {
+        remove_file_with_retry(&p).map_err(|e| {
+            StrataError::Manifest(format!("压实后删除旧段 `{}` 失败: {e}", p.display()))
+        })?;
+    }
+    let ix = ix_path(&store.root, old_id);
+    if ix.exists() {
+        remove_file_with_retry(&ix).map_err(|e| {
+            StrataError::Manifest(format!("压实后删除旧段索引 `{}` 失败: {e}", ix.display()))
+        })?;
+    }
     Ok((new_id, moved))
 }

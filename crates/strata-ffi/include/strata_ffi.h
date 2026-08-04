@@ -1,14 +1,27 @@
 /* strata-ffi — C ABI for the Strata vstore.
  *
- * Handles: `void*` returned by strata_open points to a thread-safe store
- * (RwLock-serialized); pass it back unchanged to every other call and finish
- * with strata_close.
+ * Handles: `void*` returned by strata_open points to a store whose
+ * operations (read/write/flush/gc/tier) are thread-safe on the same handle
+ * (RwLock-serialized). strata_close destroys the handle itself, so the
+ * CALLER must ensure close is mutually exclusive with all in-flight
+ * operations on that handle (quiesce first, then close). After close the
+ * handle is permanently invalid and must never be passed to any function.
+ * Pass the handle back unchanged to every call and finish with
+ * strata_close.
  *
  * Error codes (all int32_t-returning functions):
  *   0  success
  *   1  failure — call strata_last_error for details
  *   2  Rust-side panic, caught at the boundary — details via strata_last_error
  *   3  strata_read only: the key has no record
+ *
+ * The JNI layer (feature "jni", Java_dev_strata_bridge_StrataNative_*) uses
+ * different error semantics: readNative throws
+ * dev.strata.bridge.StrataException on failure (a NULL return with no
+ * pending exception means "no record"), while the C ABI here reports
+ * failures via codes 1/2/3 plus strata_last_error. JNI string arguments
+ * are read as UTF-16 (GetStringChars), so supplementary-plane code points
+ * in paths (emoji, CJK extension B) are fully supported.
  *
  * Null pointer arguments yield code 1 ("null pointer"); strata_write accepts
  * (nbt == NULL, len == 0) as an empty payload. All `char*` inputs must be
@@ -81,7 +94,10 @@ int32_t strata_tier(void* h,
                     uint32_t stable_flushes,
                     double invalid_demote_ratio);
 
-/* Drop the store. `h` is invalid afterwards; NULL is a no-op. */
+/* Drop the store. The caller must guarantee no operation is in flight on
+ * `h` (operations are RwLock-serialized, but close destroys the lock
+ * itself — concurrent use after/with close is use-after-free). `h` is
+ * permanently invalid afterwards; NULL is a no-op. */
 void strata_close(void* h);
 
 /* Copy the last error message for this thread into buf (NUL-terminated,

@@ -75,17 +75,23 @@ impl EpochLog {
         })
     }
 
-    /// Append one fixed-size ([`ENTRY_SIZE`]) entry and flush it to the OS.
+    /// Append one fixed-size ([`ENTRY_SIZE`]) entry, flush it to the OS and
+    /// sync the log file before returning.
+    ///
+    /// Per-write durability: callers rely on "segment data synced → entry
+    /// synced" (WAL ordering), so once this returns the entry is durable.
+    /// The per-record `sync_all` is deliberate and costs one metadata+data
+    /// sync per write.
     pub fn record(&mut self, e: &EpochEntry) -> Result<(), StrataError> {
         let mut buf = [0u8; ENTRY_SIZE]; // zero padding pre-filled
         buf[OFF_SEG_ID..OFF_SEG_ID + 4].copy_from_slice(&e.seg_id.to_le_bytes());
         let mut env_buf = [0u8; ENVELOPE_SIZE];
-        env_buf.copy_from_slice(&buf[OFF_ENV..OFF_ENV + ENVELOPE_SIZE]);
         e.env.encode(&mut env_buf);
         buf[OFF_ENV..OFF_ENV + ENVELOPE_SIZE].copy_from_slice(&env_buf);
         buf[OFF_OFFSET..OFF_OFFSET + 8].copy_from_slice(&e.offset.to_le_bytes());
         self.w.write_all(&buf)?;
         self.w.flush()?;
+        self.w.get_ref().sync_all()?;
         Ok(())
     }
 

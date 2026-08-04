@@ -1,6 +1,10 @@
 //! strata-ffi — Strata vstore 的 C ABI 绑定。
 //!
-//! 句柄为 `*mut c_void`（内部指向 [`SyncStore`]，RwLock 串行化，线程安全）。
+//! 句柄为 `*mut c_void`（内部指向 [`SyncStore`]）。线程模型：
+//! read/write/flush/gc/tier 对同一句柄可并发调用（RwLock 串行化）；
+//! 但 `strata_close` 销毁的是句柄本身（连同其锁）——**调用方必须保证
+//! close 与该句柄上所有在途操作互斥**（先 quiesce 再 close）。
+//! close 后句柄永久失效，不得再传入任何函数。
 //! 所有函数体以 `catch_unwind` 包裹，panic 不会穿越 FFI 边界。
 //!
 //! 错误码（见 `include/strata_ffi.h`）：
@@ -8,6 +12,10 @@
 //! `3` 仅 `strata_read`：键不存在。
 //!
 //! 最近错误存放在 thread-local：每线程一份，互不覆盖。
+//!
+//! JNI 层（feature = "jni"）错误语义与 C ABI 不同：`readNative` 失败时
+//! 抛 `dev.strata.bridge.StrataException`（键无记录仅返回 NULL、不抛），
+//! 其余入口沿用状态码 + `lastErrorNative`。
 //
 // C ABI 函数必须可从 C 侧安全调用（错误经返回值/strata_last_error 报告），
 // 不能声明为 `unsafe fn`；所有指针参数在解引用前逐一判空校验。
@@ -110,7 +118,9 @@ fn copy_to_buffer(text: &str, buf: *mut u8, len: usize) -> i32 {
 ///
 /// # Safety
 ///
-/// `h` 必须是 [`strata_open`] 返回且未被 [`strata_close`] 释放的句柄。
+/// `h` 必须是 [`strata_open`] 返回、未被 [`strata_close`] 释放的句柄，
+/// 且调用方必须保证同一句柄上没有 close 并发进行（close 与其他操作
+/// 互斥由调用方负责；否则为 use-after-free）。
 unsafe fn handle(h: *mut c_void) -> Result<&'static SyncStore, String> {
     if h.is_null() {
         return Err("null pointer".to_string());
@@ -238,7 +248,8 @@ pub(crate) fn core_tier(
     store.tier_pass(&cfg).map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// 关闭并释放 store；NULL 为无操作。之后句柄不得再使用。
+/// 关闭并释放 store；NULL 为无操作。调用方必须保证 close 与该句柄上
+/// 所有在途操作互斥；之后句柄永久失效，不得再使用。
 pub(crate) fn core_close(h: *mut c_void) {
     if h.is_null() {
         return;
@@ -444,8 +455,8 @@ pub extern "C" fn strata_tier(
         Ok(OK)
     })
 }
-
-/// 关闭并释放 store。NULL 为无操作；之后句柄不得再使用。
+/// 关闭并释放 store。NULL 为无操作。**调用方必须保证 close 与该句柄上
+/// 所有在途操作互斥**（先 quiesce 再 close）；之后句柄永久失效。
 ///
 /// # Safety
 ///

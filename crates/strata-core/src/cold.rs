@@ -481,6 +481,11 @@ impl ArchiveReader {
     /// Coordinates are absolute chunk coordinates; the archive's region origin
     /// is applied internally. Coordinates outside the region, missing slots,
     /// and invalidated slots all yield `Ok(None)`.
+    ///
+    /// Before returning, the 40-byte envelope preceding the slot payload is
+    /// validated: `payload_len` must equal the slot's recorded length and
+    /// `xxh64(payload)` must equal `payload_hash`. Any mismatch yields
+    /// [`StrataError::Corrupt`] rather than silently serving bad bytes.
     pub fn get(&mut self, x: i32, z: i32, type_id: u16) -> Result<Option<Vec<u8>>, StrataError> {
         let (x_rel, z_rel) =
             match (Self::rel_coord(x, self.region_x), Self::rel_coord(z, self.region_z)) {
@@ -499,7 +504,19 @@ impl ArchiveReader {
             (s.block, s.offset_in_block as usize, s.plain_len as usize)
         };
         let plain = self.block_data(block)?;
-        Ok(Some(plain[off..off + len].to_vec()))
+        let payload = &plain[off..off + len];
+        // Slot payloads are stored immediately after their envelope; a slot
+        // whose recorded offset leaves no room for the shell is corrupt.
+        let env_start = off.checked_sub(ENVELOPE_SIZE).ok_or_else(|| {
+            self.corrupt(format!("slot at block {block} offset {off} has no envelope room"))
+        })?;
+        let env = Envelope::decode(&plain[env_start..off].try_into().unwrap())?;
+        if env.payload_len as usize != len || xxh64(payload, 0) != env.payload_hash {
+            return Err(self.corrupt(format!(
+                "slot envelope validation failed at block {block} offset {off}"
+            )));
+        }
+        Ok(Some(payload.to_vec()))
     }
 
     /// Mark a slot invalid and persist the bitmap to `<archive>.varc.inv`.

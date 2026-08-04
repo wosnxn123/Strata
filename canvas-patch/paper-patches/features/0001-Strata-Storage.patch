@@ -8,13 +8,14 @@ diff --git a/src/main/java/org/bukkit/craftbukkit/Main.java b/src/main/java/org/
 index 8ce8de8eedfe8557848b0508857744a5b9641239..d4092fb106bdb12b27b49f5e5be382a213874e45 100644
 --- a/src/main/java/org/bukkit/craftbukkit/Main.java
 +++ b/src/main/java/org/bukkit/craftbukkit/Main.java
-@@ -50,6 +50,11 @@ public class Main {
+@@ -50,6 +50,12 @@ public class Main {
                          .defaultsTo(new File("."))
                          .describedAs("Directory containing worlds");
  
 +                // Canvas start - Strata storage one-shot startup conversion
 +                this.accepts("strataConvertToStrata", "Convert the overworld from Anvil to the Strata vstore before startup, then continue booting");
 +                this.accepts("strataConvertToAnvil", "Convert the overworld from the Strata vstore back to Anvil before startup, then continue booting");
++                this.accepts("strataForce", "Combine with --strataConvertToStrata/--strataConvertToAnvil: overwrite an existing vstore / export the vstore despite the data-loss warning");
 +                // Canvas end - Strata storage one-shot startup conversion
 +
                  this.acceptsAll(asList("w", "world", "level-name"), "World name")

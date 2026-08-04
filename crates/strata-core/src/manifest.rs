@@ -6,9 +6,12 @@
 //! format_version u32 | epoch u64 | next_gen u64 | next_seg_id u32
 //! seg_count u32 → 每段：id u32 | live u64 | total u64 | bucket u8 | created_epoch u64 | last_rewrite u64
 //! cold_count u32 → 每冷：region_x i32 | region_z i32 | invalid u32 | total u32
-//! bitmap_count u32 → 每条：x i32 | z i32 | 384B 原始位图
 //! dict_count u32 → 每槽：type_id u16 | len u32 | 字典字节
 //! ```
+//!
+//! v3 起不再持久化 region 位图快照：全局位图从未被回读，属死字节；存在性
+//! 过滤以每段内存位图（`SegState::bitmap`）为准。旧版本（v2 及以下）
+//! manifest 一律拒绝加载，由 `Store::open` 走段扫描重建路径迁移。
 //!
 //! 保存流程：写 `manifest.vsm.tmp` + fsync → 旧主副本（若存在）rename 为
 //! `manifest.vsm.bak` → tmp rename 为主副本。加载先校验主副本哈希，失败回落 `.bak`。
@@ -27,10 +30,8 @@ pub const MANIFEST_FILE: &str = "manifest.vsm";
 pub const MANIFEST_BAK_FILE: &str = "manifest.vsm.bak";
 /// 写入用临时文件名。
 const MANIFEST_TMP_FILE: &str = "manifest.vsm.tmp";
-/// 唯一支持的格式版本。
-pub const FORMAT_VERSION: u32 = 2;
-/// 每个 region 位图快照的字节数。
-pub const REGION_BITMAP_BYTES: usize = 384;
+/// 唯一支持的格式版本。v3：移除 region 位图段（旧版 manifest 走重建迁移）。
+pub const FORMAT_VERSION: u32 = 3;
 /// 字典槽数量上限。
 pub const MAX_DICT_SLOTS: usize = 16;
 
@@ -82,7 +83,7 @@ pub struct ColdMeta {
 }
 
 /// region 坐标键。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RegionKey {
     pub x: i32,
     pub z: i32,
@@ -98,29 +99,36 @@ pub struct Manifest {
     pub next_seg_id: u32,
     pub segments: Vec<SegmentMeta>,
     pub cold: Vec<ColdMeta>,
-    /// 每个 region 一份 [`REGION_BITMAP_BYTES`] 字节的位图快照。
-    pub region_bitmaps: Vec<(RegionKey, Vec<u8>)>,
     /// (type_id, 字典内容)，至多 [`MAX_DICT_SLOTS`] 槽。
     pub dict_slots: Vec<(u16, Vec<u8>)>,
 }
 
+/// 用 rename 覆盖替换目标文件（两平台的 std rename 均支持覆盖已存在目标，
+/// 不会留下"旧文件已删、新文件未就位"的崩溃窗口）；仅当 rename 本身失败
+/// （如 Windows 上目标被短暂占用）才退化为 删除+重试。
+pub(crate) fn rename_replace(tmp: &Path, dst: &Path) -> Result<(), StrataError> {
+    match std::fs::rename(tmp, dst) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            if !dst.exists() {
+                return Err(StrataError::Io(first));
+            }
+            crate::store::remove_file_with_retry(dst).map_err(StrataError::Io)?;
+            std::fs::rename(tmp, dst).map_err(StrataError::Io)
+        }
+    }
+}
+
 impl Manifest {
     /// 保存：序列化 body → 前置 xxh64 → 写 tmp + fsync → 旧主副本降级为
-    /// `.bak` → tmp 升级为主副本。
+    /// `.bak` → tmp 升级为主副本。两次降级/升级均为覆盖式 rename，
+    /// 任何时刻主副本要么是旧内容要么是新内容，不会缺失。
     pub fn save(&self, dir: &Path) -> Result<(), StrataError> {
         if self.format_version != FORMAT_VERSION {
             return Err(StrataError::Manifest(format!(
                 "unsupported format_version {} (expected {FORMAT_VERSION})",
                 self.format_version
             )));
-        }
-        for (_, bm) in &self.region_bitmaps {
-            if bm.len() != REGION_BITMAP_BYTES {
-                return Err(StrataError::Manifest(format!(
-                    "region bitmap must be {REGION_BITMAP_BYTES} bytes, got {}",
-                    bm.len()
-                )));
-            }
         }
         if self.dict_slots.len() > MAX_DICT_SLOTS {
             return Err(StrataError::Manifest(format!(
@@ -144,13 +152,9 @@ impl Manifest {
         f.sync_all()?;
 
         if main.exists() {
-            // Windows 上 rename 到已存在的目标会失败，先清掉旧 bak。
-            if bak.exists() {
-                std::fs::remove_file(&bak)?;
-            }
-            std::fs::rename(&main, &bak)?;
+            rename_replace(&main, &bak)?;
         }
-        std::fs::rename(&tmp, &main)?;
+        rename_replace(&tmp, &main)?;
         Ok(())
     }
 
@@ -202,13 +206,6 @@ impl Manifest {
             b.extend_from_slice(&c.region_z.to_le_bytes());
             b.extend_from_slice(&c.invalid_count.to_le_bytes());
             b.extend_from_slice(&c.total_slots.to_le_bytes());
-        }
-
-        b.extend_from_slice(&(self.region_bitmaps.len() as u32).to_le_bytes());
-        for (k, bm) in &self.region_bitmaps {
-            b.extend_from_slice(&k.x.to_le_bytes());
-            b.extend_from_slice(&k.z.to_le_bytes());
-            b.extend_from_slice(bm);
         }
 
         b.extend_from_slice(&(self.dict_slots.len() as u32).to_le_bytes());
@@ -321,15 +318,6 @@ fn decode_body(body: &[u8]) -> Result<Manifest, StrataError> {
         });
     }
 
-    let bitmap_count = r.u32()?;
-    let mut region_bitmaps = Vec::new();
-    for _ in 0..bitmap_count {
-        let x = r.i32()?;
-        let z = r.i32()?;
-        let bm = r.take(REGION_BITMAP_BYTES)?.to_vec();
-        region_bitmaps.push((RegionKey { x, z }, bm));
-    }
-
     let dict_count = r.u32()?;
     if dict_count as usize > MAX_DICT_SLOTS {
         return Err(StrataError::Manifest(format!(
@@ -352,7 +340,6 @@ fn decode_body(body: &[u8]) -> Result<Manifest, StrataError> {
         next_seg_id,
         segments,
         cold,
-        region_bitmaps,
         dict_slots,
     })
 }
@@ -363,7 +350,7 @@ mod tests {
 
     fn sample() -> Manifest {
         Manifest {
-            format_version: 2,
+            format_version: FORMAT_VERSION,
             epoch: 3,
             next_gen: 42,
             next_seg_id: 5,
@@ -381,7 +368,6 @@ mod tests {
                 invalid_count: 0,
                 total_slots: 1024,
             }],
-            region_bitmaps: vec![(RegionKey { x: 0, z: 0 }, vec![0xAB; 384])],
             dict_slots: vec![(0, vec![1, 2, 3])],
         }
     }
@@ -457,6 +443,24 @@ mod tests {
         // 截断 body 尾部一字节（字典数据）→ 越界错误。
         let body = sample().encode_body();
         write_raw(dir.path(), &body[..body.len() - 1]);
+        assert!(Manifest::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn legacy_v2_manifest_rejected() {
+        // v2 body：头部同 v3，但 cold_count 之后还带 bitmap_count 段。
+        // 版本校验必须在读任何内容前拒绝（迁移走 Store::open 重建路径）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes()); // format_version = 2
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // seg_count
+        body.extend_from_slice(&0u32.to_le_bytes()); // cold_count
+        body.extend_from_slice(&0u32.to_le_bytes()); // bitmap_count
+        body.extend_from_slice(&0u32.to_le_bytes()); // dict_count
+        write_raw(dir.path(), &body);
         assert!(Manifest::load(dir.path()).is_err());
     }
 }

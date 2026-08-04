@@ -6,6 +6,15 @@
 //! - `verify` / `compact` / `stats`；
 //! - `recompress <world>`：按当前配置重写各维度 vstore 的全部存活记录。
 //!
+//! 关键语义：
+//! - vstore 负载规范格式 = gzip 压缩的 NBT（与运行时 NbtIo.writeCompressed/
+//!   readCompressed 对称）；to-anvil 对历史裸 NBT 负载按 legacy raw 原样写回。
+//! - 断点续转进度仅在同一 vstore 生命周期内有效：vstore 存在且 manifest 完好
+//!   且进度文件存在才续传，否则删除后全量重建。
+//! - 每个维度处理前做 vstore.old / vstore.new 残留预检（崩溃恢复/清理）。
+//! - verify / compact / stats / recompress 的多维度循环为聚合式：单维度失败
+//!   不中止，全部执行完后汇总报错（非零退出码）。
+//!
 //! 世界布局：`<world>/region|r.0.0.mca`（Anvil），`<world>/vstore/`（Strata Store root）。
 //! 维度根候选（按序）：世界根（overworld）、`DIM-1`/`DIM1`（vanilla 布局）、
 //! `dimensions/minecraft/<name>`（Canvas/Paper 布局）；目录含 region/entities/poi
@@ -16,13 +25,16 @@ pub mod anvil;
 pub mod config;
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use strata_core::cold::ArchiveReader;
-use strata_core::gc::GcConfig;
+use strata_core::gc::GcStats;
 use strata_core::manifest::Manifest;
 use strata_core::segment::scan_segment;
 use strata_core::store::Store;
@@ -182,11 +194,15 @@ fn discover_dim_roots(world: &Path) -> Vec<DimRoot> {
         .collect()
 }
 
-/// 世界根下全部含 vstore 的维度根（to-anvil / verify / compact / stats / recompress 用）。
+/// 世界根下全部含 vstore（或可恢复 vstore.old）的维度根
+/// （to-anvil / verify / compact / stats / recompress 用）。
 fn discover_vstore_roots(world: &Path) -> Vec<DimRoot> {
     candidate_dim_paths(world)
         .into_iter()
-        .filter(|p| p.join(VSTORE_DIR).join(MANIFEST_FILE).exists())
+        .filter(|p| {
+            p.join(VSTORE_DIR).join(MANIFEST_FILE).exists()
+                || p.join(VSTORE_OLD_DIR).join(MANIFEST_FILE).exists()
+        })
         .map(|path| dim_root(world, path))
         .collect()
 }
@@ -194,6 +210,7 @@ fn discover_vstore_roots(world: &Path) -> Vec<DimRoot> {
 // ---------------------------------------------------------------- shared helpers
 
 /// 递归累计目录字节数（文件长度之和；不存在 → 0）。
+/// 符号链接一律跳过（不跟随）：避免链接环死循环与重复计数。
 fn dir_bytes(path: &Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(path) else {
         return 0;
@@ -201,9 +218,15 @@ fn dir_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
     for entry in rd.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
             total += dir_bytes(&path);
-        } else if let Ok(meta) = entry.metadata() {
+        } else {
             total += meta.len();
         }
     }
@@ -211,6 +234,7 @@ fn dir_bytes(path: &Path) -> u64 {
 }
 
 /// 递归统计扩展名为 `ext` 的文件数（`ext` 含点，如 ".varc"）。
+/// 符号链接一律跳过（不跟随），与 [`dir_bytes`] 一致。
 fn count_files_recursive(path: &Path, ext: &str) -> u64 {
     let Ok(rd) = std::fs::read_dir(path) else {
         return 0;
@@ -218,13 +242,94 @@ fn count_files_recursive(path: &Path, ext: &str) -> u64 {
     let mut count = 0u64;
     for entry in rd.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
             count += count_files_recursive(&path, ext);
         } else if entry.file_name().to_string_lossy().ends_with(ext) {
             count += 1;
         }
     }
     count
+}
+
+/// 预检：处理上次崩溃遗留的 vstore.old / vstore.new（处理每个维度前调用）。
+///
+/// - vstore 缺失但 vstore.old 存在 → rename vstore.old → vstore
+///   （recompress 交换中途崩溃的恢复路径），打印醒目提示；
+/// - vstore 存在且残留 vstore.new → 删除 vstore.new（未完成的中间产物）；
+/// - vstore 与 vstore.old 同时存在 → 报错要求人工介入，不猜
+///   （`is_recompress` 例外：recompress 自己管理备份槽，交换协议会替换 vstore.old）。
+fn preflight_vstore(dim: &DimRoot, is_recompress: bool) -> anyhow::Result<()> {
+    let vstore = dim.path.join(VSTORE_DIR);
+    let old_root = dim.path.join(VSTORE_OLD_DIR);
+    let new_root = dim.path.join(VSTORE_NEW_DIR);
+
+    if vstore.exists() && old_root.exists() && !is_recompress {
+        bail!(
+            "维度 {} 同时存在 {} 与 {}，无法自动判定哪个有效，请人工核对后只保留其一",
+            dim.path.display(),
+            VSTORE_DIR,
+            VSTORE_OLD_DIR
+        );
+    }
+    if !vstore.exists() && old_root.exists() {
+        std::fs::rename(&old_root, &vstore).with_context(|| {
+            format!(
+                "恢复维度 {}：重命名 {} → {}",
+                dim.label(),
+                old_root.display(),
+                vstore.display()
+            )
+        })?;
+        eprintln!(
+            "WARN: 维度 {} 缺少 {}，已从备份自动恢复 {} → {}（上次 recompress 可能崩在交换中途）",
+            dim.label(),
+            VSTORE_DIR,
+            VSTORE_OLD_DIR,
+            VSTORE_DIR
+        );
+    }
+    if vstore.exists() && new_root.exists() {
+        remove_dir_with_retry(&new_root)
+            .with_context(|| format!("清理遗留的 {}", new_root.display()))?;
+        eprintln!(
+            "WARN: 维度 {} 残留未完成的中间产物 {}，已删除",
+            dim.label(),
+            VSTORE_NEW_DIR
+        );
+    }
+    Ok(())
+}
+
+/// 聚合各维度失败：逐一打印后以汇总错误返回（非零退出码）。
+fn report_dim_failures(op: &str, failures: &[(String, anyhow::Error)]) -> anyhow::Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let mut msg = format!("{op}：{} 个维度失败", failures.len());
+    for (label, err) in failures {
+        msg.push_str(&format!("\n  {label}: {err:#}"));
+    }
+    bail!("{msg}")
+}
+
+/// vstore 负载规范格式 = gzip 压缩的 NBT 字节（与运行时 NbtIo.writeCompressed 对称）。
+fn gzip_nbt(nbt: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(nbt)?;
+    enc.finish()
+}
+
+/// [`gzip_nbt`] 的逆操作；负载不是 gzip（历史裸 NBT 数据）→ Err。
+fn gunzip_nbt(payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    GzDecoder::new(payload).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 /// 解析 `r.X.Z.mca` 文件名中的 region 坐标。
@@ -441,25 +546,62 @@ fn convert_to_strata(world: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 单维度 Anvil → Strata：覆盖目标 vstore、保留 Anvil 源。
-/// 返回（转换 region 数、写入记录数、按进度跳过 region 数）。
+/// 单维度 Anvil → Strata：覆盖目标 vstore、保留 Anvil 源，负载以规范格式
+/// gzip(NBT) 写入。返回（转换 region 数、写入记录数、按进度跳过 region 数）。
+///
+/// **进度仅在同一 vstore 生命周期内有效**：vstore 存在且 manifest 完好且
+/// 进度文件存在 → 续传（保留现有 vstore，跳过已完成 region）；其它一切情况
+/// （无进度 / 无 vstore / manifest 缺失或损坏）→ 删除后从零全量重建。
 fn convert_dim_to_strata(
     dim: &DimRoot,
     cfg: &config::StrataConfig,
 ) -> anyhow::Result<(u64, u64, u64)> {
+    preflight_vstore(dim, false)?;
     let vstore = dim.path.join(VSTORE_DIR);
+    let progress_path = vstore.join(PROGRESS_FILE);
 
-    // 覆盖语义：进度文件在 vstore 内 → 先读进度，再整体删除重建。
-    // Windows 上新写入的文件可能被杀软短暂锁定，remove_dir_all 带重试。
-    let mut done = HashSet::new();
-    if vstore.exists() {
-        done = load_progress(&vstore.join(PROGRESS_FILE));
-        remove_dir_with_retry(&vstore)
-            .with_context(|| format!("删除旧 vstore {}", vstore.display()))?;
-    }
+    // 续传条件：vstore 存在 AND manifest 完好（Manifest::load 读出）AND 进度文件存在。
+    // 进度文件在 vstore 内：manifest 缺失/损坏说明进度对应的写入对象已不可信，
+    // 此时残留进度只会导致跳过本应重转的 region，必须全量重建。
+    let resume_store = if vstore.exists() {
+        match Manifest::load(&vstore) {
+            Ok(Some(_)) if progress_path.exists() => Some(
+                Store::open(&vstore, cfg.store.clone())
+                    .with_context(|| format!("打开 vstore {}", vstore.display()))?,
+            ),
+            Ok(Some(_)) => None, // vstore 完好但无进度 → 覆盖语义：全量重建
+            Ok(None) => {
+                eprintln!(
+                    "WARN: 维度 {} 的 vstore 缺少 manifest，忽略残留进度并全量重建",
+                    dim.label()
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARN: 维度 {} 的 vstore manifest 损坏（{e}），忽略残留进度并全量重建",
+                    dim.label()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    let mut store = Store::open(&vstore, cfg.store.clone())
-        .with_context(|| format!("打开 vstore {}", vstore.display()))?;
+    let (mut store, done) = match resume_store {
+        Some(s) => (s, load_progress(&progress_path)),
+        None => {
+            // Windows 上新写入的文件可能被杀软短暂锁定，remove_dir_all 带重试。
+            if vstore.exists() {
+                remove_dir_with_retry(&vstore)
+                    .with_context(|| format!("删除旧 vstore {}", vstore.display()))?;
+            }
+            let s = Store::open(&vstore, cfg.store.clone())
+                .with_context(|| format!("打开 vstore {}", vstore.display()))?;
+            (s, HashSet::new())
+        }
+    };
 
     let mut regions_converted = 0u64;
     let mut regions_skipped = 0u64;
@@ -489,7 +631,11 @@ fn convert_dim_to_strata(
             for c in &chunks {
                 let cx = rx * 32 + c.x as i32;
                 let cz = rz * 32 + c.z as i32;
-                store.write(cx, cz, kind.type_id, &c.nbt).with_context(|| {
+                // 规范负载格式 = gzip(NBT)，与运行时 NbtIo.writeCompressed 对称。
+                let payload = gzip_nbt(&c.nbt).with_context(|| {
+                    format!("gzip 编码 ({cx}, {cz}) type {}", kind.type_id)
+                })?;
+                store.write(cx, cz, kind.type_id, &payload).with_context(|| {
                     format!("写入 ({cx}, {cz}) type {}", kind.type_id)
                 })?;
                 chunks_written += 1;
@@ -502,12 +648,16 @@ fn convert_dim_to_strata(
         }
     }
 
-    // 收尾：删除进度文件。
+    // 收尾：删除进度文件。删除失败必须硬错误——留下完整进度会让下次运行
+    // 误入续传路径跳过 region。
     drop(store);
-    let progress = vstore.join(PROGRESS_FILE);
-    if progress.exists() {
-        remove_with_retry(&progress)
-            .with_context(|| format!("删除进度文件 {}", progress.display()))?;
+    if progress_path.exists() {
+        remove_with_retry(&progress_path).with_context(|| {
+            format!(
+                "删除进度文件 {} 失败，请手动删除该文件后重跑本命令",
+                progress_path.display()
+            )
+        })?;
     }
 
     let bytes = dir_bytes(&vstore);
@@ -532,44 +682,61 @@ fn convert_to_anvil(world: &Path) -> anyhow::Result<()> {
     let cfg = load_or_create_template(world)?;
     let mut total_regions = 0u64;
     let mut total_chunks = 0u64;
+    let mut total_legacy = 0u64;
     for dim in &dims {
-        let (regions, chunks) = convert_dim_to_anvil(dim, &cfg)?;
+        let (regions, chunks, legacy) = convert_dim_to_anvil(dim, &cfg)?;
         total_regions += regions;
         total_chunks += chunks;
+        total_legacy += legacy;
     }
 
     println!(
         "转回完成：共 {} 个维度，{total_regions} 个 region（{total_chunks} 条记录）写回 Anvil",
         dims.len()
     );
+    if total_legacy > 0 {
+        println!("其中 {total_legacy} 条为 legacy raw records（历史裸 NBT，未按规范 gzip），已按原样写回");
+    }
     println!("vstore 已保留，请验证后手动删除");
     Ok(())
 }
 
 /// 单维度 Strata → Anvil：vstore → region/entities/poi 的 DEFLATE .mca。
-/// 返回（写回 region 数、写回记录数）。
+/// 负载按规范格式 gzip(NBT) 解出裸 NBT 再写回；历史裸格式负载按原样写回并计数。
+/// 返回（写回 region 数、写回记录数、legacy raw 记录数）。
 fn convert_dim_to_anvil(
     dim: &DimRoot,
     cfg: &config::StrataConfig,
-) -> anyhow::Result<(u64, u64)> {
+) -> anyhow::Result<(u64, u64, u64)> {
+    preflight_vstore(dim, false)?;
     let vstore = dim.path.join(VSTORE_DIR);
     let store = Store::open(&vstore, cfg.store.clone())
         .with_context(|| format!("打开 vstore {}", vstore.display()))?;
 
-    // 段扫描聚合存活记录（latest gen），再解压 NBT（store.read = latest gen 视图
+    // 段扫描聚合存活记录（latest gen），再解出 NBT（store.read = latest gen 视图
     // + 编码/字典解析，冷归档键由 read 的冷查路径兜底）。
     let latest = latest_gens(&vstore)?;
     let mut out: HashMap<(u16, i32, i32), Vec<ChunkLoc>> = HashMap::new();
     let mut skipped = 0u64;
+    let mut legacy_raw = 0u64;
     for &(x, z, type_id) in latest.keys() {
         if kind_by_type_id(type_id).is_none() {
             skipped += 1; // 未知类型不写回 Anvil
             continue;
         }
-        let Some(nbt) = store.read(x, z, type_id)? else {
+        let Some(payload) = store.read(x, z, type_id)? else {
             skipped += 1;
             continue;
         };
+        // 规范负载 = gzip(NBT) → gunzip 出裸 NBT；gunzip 失败说明是历史裸格式
+        // 转换产物，按裸 NBT 直接写回并计数提示。
+        let (nbt, legacy) = match gunzip_nbt(&payload) {
+            Ok(raw) => (raw, false),
+            Err(_) => (payload, true),
+        };
+        if legacy {
+            legacy_raw += 1;
+        }
         let (rx, rz) = (x >> 5, z >> 5);
         out.entry((type_id, rx, rz)).or_default().push(ChunkLoc {
             x: (x & 31) as u8,
@@ -611,7 +778,7 @@ fn convert_dim_to_anvil(
         "维度 {}：{regions_written} 个 region（{chunks_written} 条记录，{bytes_written} 字节）写回 Anvil",
         dim.path.display()
     );
-    Ok((regions_written, chunks_written))
+    Ok((regions_written, chunks_written, legacy_raw))
 }
 
 // ---------------------------------------------------------------- verify / compact / stats
@@ -625,17 +792,36 @@ fn verify(world: &Path) -> anyhow::Result<()> {
         );
     }
     let cfg = load_or_create_template(world)?;
+    // 单维度失败不中止：收集后聚合报告，非零退出。
+    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
     for dim in &dims {
-        println!("== {} ==", dim.path.display());
-        let vstore = dim.path.join(VSTORE_DIR);
-        let store = Store::open(&vstore, cfg.store.clone())
-            .with_context(|| format!("打开 vstore {}", vstore.display()))?;
-        let report = store.verify()?;
-        println!("records: {}", report.records);
-        println!("corrupt: {}", report.corrupt_records.len());
-        for (seg_id, offset) in &report.corrupt_records {
-            println!("  seg-{seg_id:04} @ offset {offset}");
+        if let Err(e) = verify_dim(dim, &cfg) {
+            eprintln!("ERROR: 维度 {} verify 失败：{e:#}", dim.path.display());
+            failures.push((dim.label().to_string(), e));
         }
+    }
+    report_dim_failures("verify", &failures)
+}
+
+/// 单维度校验；发现损坏记录 → 返回错误（由 main 层映射为非零退出码）。
+fn verify_dim(dim: &DimRoot, cfg: &config::StrataConfig) -> anyhow::Result<()> {
+    preflight_vstore(dim, false)?;
+    println!("== {} ==", dim.path.display());
+    let vstore = dim.path.join(VSTORE_DIR);
+    let store = Store::open(&vstore, cfg.store.clone())
+        .with_context(|| format!("打开 vstore {}", vstore.display()))?;
+    let report = store.verify()?;
+    println!("records: {}", report.records);
+    println!("corrupt: {}", report.corrupt_records.len());
+    for (seg_id, offset) in &report.corrupt_records {
+        println!("  seg-{seg_id:04} @ offset {offset}");
+    }
+    if !report.corrupt_records.is_empty() {
+        bail!(
+            "维度 {} 存在 {} 条损坏记录",
+            dim.label(),
+            report.corrupt_records.len()
+        );
     }
     Ok(())
 }
@@ -649,42 +835,59 @@ fn compact(world: &Path) -> anyhow::Result<()> {
         );
     }
     let cfg = load_or_create_template(world)?;
+    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
     for dim in &dims {
-        println!("== {} ==", dim.path.display());
-        let vstore = dim.path.join(VSTORE_DIR);
-        let mut store = Store::open(&vstore, cfg.store.clone())
-            .with_context(|| format!("打开 vstore {}", vstore.display()))?;
-
-        let gc_cfg = GcConfig::default();
-        let mut reclaimed_total = 0u64;
-        let mut segments_removed = 0u32;
-        let mut holes_punched = 0u32;
-        let mut records_moved = 0u64;
-        let mut promoted_total = 0u64;
-        let mut demoted_total = 0u64;
-
-        // 循环直到 GC 与分层都无进展（reclaimed==0 且 promoted+demoted==0）。
-        loop {
-            let gc = store.gc_pass(&gc_cfg)?;
-            let tier = store.tier_pass(&cfg.tier)?;
-            if gc.reclaimed_bytes == 0 && tier.promoted + tier.demoted == 0 {
-                break;
-            }
-            reclaimed_total += gc.reclaimed_bytes;
-            segments_removed += gc.segments_removed;
-            holes_punched += gc.holes_punched;
-            records_moved += gc.records_moved;
-            promoted_total += tier.promoted as u64;
-            demoted_total += tier.demoted as u64;
+        if let Err(e) = compact_dim(dim, &cfg) {
+            eprintln!("ERROR: 维度 {} compact 失败：{e:#}", dim.path.display());
+            failures.push((dim.label().to_string(), e));
         }
-
-        let (live, total) = store.touch_stats();
-        println!(
-            "压实完成：总回收 {reclaimed_total} 字节（整段删除 {segments_removed} 段，挖洞 {holes_punched} 处，搬迁 {records_moved} 条）"
-        );
-        println!("分层：晋升 {promoted_total} 段，降级 {demoted_total} 段");
-        println!("当前段表：live {live} 字节 / total {total} 字节");
     }
+    report_dim_failures("compact", &failures)
+}
+
+fn compact_dim(dim: &DimRoot, cfg: &config::StrataConfig) -> anyhow::Result<()> {
+    preflight_vstore(dim, false)?;
+    println!("== {} ==", dim.path.display());
+    let vstore = dim.path.join(VSTORE_DIR);
+    let mut store = Store::open(&vstore, cfg.store.clone())
+        .with_context(|| format!("打开 vstore {}", vstore.display()))?;
+
+    if !cfg.gc_enabled {
+        println!("提示：strata.gc.enabled=false，跳过 GC 阶段（冷热分层照常）");
+    }
+
+    let mut reclaimed_total = 0u64;
+    let mut segments_removed = 0u32;
+    let mut holes_punched = 0u32;
+    let mut records_moved = 0u64;
+    let mut promoted_total = 0u64;
+    let mut demoted_total = 0u64;
+
+    // 循环直到 GC 与分层都无进展（reclaimed==0 且 promoted+demoted==0）。
+    loop {
+        let gc = if cfg.gc_enabled {
+            store.gc_pass(&cfg.gc)?
+        } else {
+            GcStats::default()
+        };
+        let tier = store.tier_pass(&cfg.tier)?;
+        if gc.reclaimed_bytes == 0 && tier.promoted + tier.demoted == 0 {
+            break;
+        }
+        reclaimed_total += gc.reclaimed_bytes;
+        segments_removed += gc.segments_removed;
+        holes_punched += gc.holes_punched;
+        records_moved += gc.records_moved;
+        promoted_total += tier.promoted as u64;
+        demoted_total += tier.demoted as u64;
+    }
+
+    let (live, total) = store.touch_stats();
+    println!(
+        "压实完成：总回收 {reclaimed_total} 字节（整段删除 {segments_removed} 段，挖洞 {holes_punched} 处，搬迁 {records_moved} 条）"
+    );
+    println!("分层：晋升 {promoted_total} 段，降级 {demoted_total} 段");
+    println!("当前段表：live {live} 字节 / total {total} 字节");
     Ok(())
 }
 
@@ -697,23 +900,33 @@ fn stats(world: &Path) -> anyhow::Result<()> {
         );
     }
     let cfg = load_or_create_template(world)?;
+    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
     for dim in &dims {
-        println!("== {} ==", dim.path.display());
-        let vstore = dim.path.join(VSTORE_DIR);
-        let store = Store::open(&vstore, cfg.store.clone())
-            .with_context(|| format!("打开 vstore {}", vstore.display()))?;
-
-        let (live, total) = store.touch_stats();
-        let segments = list_segment_files(&vstore)?.len();
-        let cold_archives = count_files_recursive(&vstore, ".varc");
-        let bytes = dir_bytes(&vstore);
-
-        println!("live_bytes: {live}");
-        println!("total_bytes: {total}");
-        println!("segments: {segments}");
-        println!("cold_archives: {cold_archives}");
-        println!("vstore_bytes: {bytes}");
+        if let Err(e) = stats_dim(dim, &cfg) {
+            eprintln!("ERROR: 维度 {} stats 失败：{e:#}", dim.path.display());
+            failures.push((dim.label().to_string(), e));
+        }
     }
+    report_dim_failures("stats", &failures)
+}
+
+fn stats_dim(dim: &DimRoot, cfg: &config::StrataConfig) -> anyhow::Result<()> {
+    preflight_vstore(dim, false)?;
+    println!("== {} ==", dim.path.display());
+    let vstore = dim.path.join(VSTORE_DIR);
+    let store = Store::open(&vstore, cfg.store.clone())
+        .with_context(|| format!("打开 vstore {}", vstore.display()))?;
+
+    let (live, total) = store.touch_stats();
+    let segments = list_segment_files(&vstore)?.len();
+    let cold_archives = count_files_recursive(&vstore, ".varc");
+    let bytes = dir_bytes(&vstore);
+
+    println!("live_bytes: {live}");
+    println!("total_bytes: {total}");
+    println!("segments: {segments}");
+    println!("cold_archives: {cold_archives}");
+    println!("vstore_bytes: {bytes}");
     Ok(())
 }
 
@@ -736,15 +949,24 @@ fn recompress(world: &Path) -> anyhow::Result<()> {
         eprintln!("WARN: {w}");
     }
 
+    // 单维度失败不中止：收集后聚合报告，非零退出。
+    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
     for dim in &dims {
-        recompress_dim(dim, &cfg)?;
+        if let Err(e) = recompress_dim(dim, &cfg) {
+            eprintln!("ERROR: 维度 {} 重压缩失败：{e:#}", dim.path.display());
+            failures.push((dim.label().to_string(), e));
+        }
     }
+    report_dim_failures("recompress", &failures)?;
     println!("重压缩完成：共 {} 个维度", dims.len());
     Ok(())
 }
 
 /// 单维度重压缩。失败只清理 vstore.new，绝不动原 vstore。
 fn recompress_dim(dim: &DimRoot, cfg: &config::StrataConfig) -> anyhow::Result<()> {
+    // is_recompress=true：vstore+vstore.old 并存是上次成功重压缩的正常备份态，
+    // 由本函数的交换协议接管（下方先删旧备份），不触发人工介入选路。
+    preflight_vstore(dim, true)?;
     let vstore = dim.path.join(VSTORE_DIR);
     let new_root = dim.path.join(VSTORE_NEW_DIR);
     let old_root = dim.path.join(VSTORE_OLD_DIR);
@@ -796,66 +1018,61 @@ fn recompress_dim(dim: &DimRoot, cfg: &config::StrataConfig) -> anyhow::Result<(
     Ok(())
 }
 
-/// 重压缩核心：读出 → 重写 → 校验。成功返回记录数。
+/// 重压缩核心（流式，两遍）：第一遍只收集存活键集合；第二遍逐键
+/// 读 → 写 vstore.new → 立即读回比对 xxhash。负载全程透传（规范格式
+/// gzip(NBT) 对重压缩透明），不把所有解压负载驻留内存。成功返回记录数。
 fn recompress_dim_inner(
     vstore: &Path,
     new_root: &Path,
     cfg: &config::StrataConfig,
 ) -> anyhow::Result<u64> {
-    // 1. 读出全部存活记录 (x, z, type_id, payload)：
-    //    热层 = 段扫描 latest gen；冷层 = 冷归档未被失效的槽位。
-    let mut records: Vec<(i32, i32, u16, Vec<u8>, u64)> = Vec::new();
-    {
-        let store = Store::open(vstore, cfg.store.clone())
-            .with_context(|| format!("打开 vstore {}", vstore.display()))?;
+    // 1. 存活键集合：热层 = 段扫描 latest gen；冷层 = 冷归档未被失效的槽位。
+    let keys: Vec<(i32, i32, u16)> = {
         let hot = latest_gens(vstore)?;
         let cold = cold_live_keys(vstore, &hot)?;
-        for &(x, z, type_id) in hot.keys().chain(cold.iter()) {
-            let Some(nbt) = store.read(x, z, type_id)? else {
-                bail!(
-                    "存活记录 ({x}, {z}, type {type_id}) 无法从 {} 读出",
-                    vstore.display()
-                );
-            };
-            let hash = xxh64(&nbt, 0);
-            records.push((x, z, type_id, nbt, hash));
-        }
-    }
+        hot.keys().copied().chain(cold).collect()
+    };
 
-    // 2. 用当前配置写入 vstore.new。
-    {
-        let mut new_store = Store::open(new_root, cfg.store.clone())
-            .with_context(|| format!("创建 {}", new_root.display()))?;
-        for (x, z, type_id, nbt, _) in &records {
-            new_store.write(*x, *z, *type_id, nbt).with_context(|| {
-                format!("写入 ({x}, {z}, type {type_id}) 至 {}", new_root.display())
-            })?;
-        }
-        new_store.flush().context("flush vstore.new")?;
-
-        // 3. 校验：逐条读回比对 xxhash + 记录数/损坏数核对。
-        for (x, z, type_id, _nbt, hash) in &records {
-            let Some(back) = new_store.read(*x, *z, *type_id)? else {
-                bail!("重压缩后无法读回 ({x}, {z}, type {type_id})");
-            };
-            if xxh64(&back, 0) != *hash {
-                bail!("重压缩后 ({x}, {z}, type {type_id}) 负载哈希不一致");
-            }
-        }
-        let report = new_store.verify()?;
-        if report.records != records.len() as u64 {
+    // 2. 逐键读（旧）→ 写（新）→ 读回新存储比对哈希。write 内部会把段写入
+    //    刷到 OS（flush_buf），同会话读回无需先整体 flush。
+    let store = Store::open(vstore, cfg.store.clone())
+        .with_context(|| format!("打开 vstore {}", vstore.display()))?;
+    let mut new_store = Store::open(new_root, cfg.store.clone())
+        .with_context(|| format!("创建 {}", new_root.display()))?;
+    let mut count = 0u64;
+    for &(x, z, type_id) in &keys {
+        let Some(nbt) = store.read(x, z, type_id)? else {
             bail!(
-                "重压缩后记录数不符：期望 {}，盘上扫描 {}",
-                records.len(),
-                report.records
+                "存活记录 ({x}, {z}, type {type_id}) 无法从 {} 读出",
+                vstore.display()
             );
+        };
+        let hash = xxh64(&nbt, 0);
+        new_store.write(x, z, type_id, &nbt).with_context(|| {
+            format!("写入 ({x}, {z}, type {type_id}) 至 {}", new_root.display())
+        })?;
+        let Some(back) = new_store.read(x, z, type_id)? else {
+            bail!("重压缩后无法读回 ({x}, {z}, type {type_id})");
+        };
+        if xxh64(&back, 0) != hash {
+            bail!("重压缩后 ({x}, {z}, type {type_id}) 负载哈希不一致");
         }
-        if !report.corrupt_records.is_empty() {
-            bail!("重压缩后出现 {} 条损坏记录", report.corrupt_records.len());
-        }
+        count += 1;
     }
+    new_store.flush().context("flush vstore.new")?;
 
-    Ok(records.len() as u64)
+    // 3. 收尾校验：记录数/损坏数核对。
+    let report = new_store.verify()?;
+    if report.records != count {
+        bail!(
+            "重压缩后记录数不符：期望 {count}，盘上扫描 {}",
+            report.records
+        );
+    }
+    if !report.corrupt_records.is_empty() {
+        bail!("重压缩后出现 {} 条损坏记录", report.corrupt_records.len());
+    }
+    Ok(count)
 }
 
 #[cfg(test)]

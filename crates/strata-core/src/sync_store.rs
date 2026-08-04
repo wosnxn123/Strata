@@ -5,10 +5,10 @@
 //! - 写路径（`write`/`write_batch`/`flush`/`gc_pass`/`tier_pass`）取写锁，
 //!   全程独占 `Store`，避免 `&self` 与 `&mut self` 路径交错触碰内部状态。
 //!
-//! `Store` 的 `RefCell`（cold_readers）本身阻碍自动 `Sync`，但被 `RwLock`
-//! 包裹后，任何时刻至多一条写锁线程持有 `&mut Store`，读锁线程只拿 `&Store`
-//! 且其借用不跨越写锁临界区——内部可变性被外层锁串行化，整体满足 `Send + Sync`
-//! （`Store` 在 [`crate::store`] 中显式声明了 `Sync`，见该处 Safety 注释）。
+//! `Store` 全部字段为真 `Send + Sync`（内部可变性只通过 `Mutex`：索引页
+//! 缓存与冷归档读取器），编译器自动派生，无需 unsafe 断言。`RwLock` 在此
+//! 之上负责写路径互斥；并发读路径经 `Store` 内部 `Mutex` 短临界区共享
+//! 缓存/读取器（见 [`crate::store::Store`] 的线程模型说明）。
 
 use std::path::Path;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};

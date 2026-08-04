@@ -4,7 +4,7 @@
 //! 后接紧排的信封序列（每条 = 40B 信封 + payload_len 字节负载，无对齐填充）。
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::envelope::{Envelope, ENVELOPE_SIZE};
@@ -16,8 +16,12 @@ pub const SEG_HEADER_SIZE: u64 = 16;
 pub const SEG_MAGIC: [u8; 4] = *b"VS01";
 
 /// 追加式段文件写入器。`offset` 指向下一条记录的写入位置。
+///
+/// 任何写失败（部分写）都会触发 [`SegmentWriter::recover_partial_write`]：
+/// 丢弃不可信的 BufWriter 缓冲、把文件截断回逻辑 offset、重建缓冲——
+/// 写入器要么完整可用、要么彻底作废，绝不带伤复用。
 pub struct SegmentWriter {
-    w: BufWriter<File>,
+    w: Option<BufWriter<File>>,
     offset: u64,
 }
 
@@ -37,13 +41,14 @@ impl SegmentWriter {
         w.write_all(&header)?;
 
         Ok(Self {
-            w,
+            w: Some(w),
             offset: SEG_HEADER_SIZE,
         })
     }
 
     /// 追加一条记录（信封 + 负载），返回该信封头的文件偏移。
     /// `env.payload_len` 必须等于 `payload.len()`。
+    /// 写失败时先做部分写恢复再向上报错，写入器仍可继续接受追加。
     pub fn append(&mut self, env: &Envelope, payload: &[u8]) -> Result<u64, StrataError> {
         debug_assert_eq!(
             env.payload_len as usize,
@@ -55,8 +60,18 @@ impl SegmentWriter {
 
         let mut buf = [0u8; ENVELOPE_SIZE];
         env.encode(&mut buf);
-        self.w.write_all(&buf)?;
-        self.w.write_all(payload)?;
+        let res = match self.w.as_mut() {
+            Some(w) => w.write_all(&buf).and_then(|()| w.write_all(payload)),
+            None => {
+                return Err(StrataError::Io(std::io::Error::other(
+                    "segment writer is dead after unrecoverable write failure",
+                )))
+            }
+        };
+        if let Err(e) = res {
+            self.recover_partial_write();
+            return Err(StrataError::Io(e));
+        }
 
         self.offset += ENVELOPE_SIZE as u64 + payload.len() as u64;
         Ok(start)
@@ -69,22 +84,78 @@ impl SegmentWriter {
 
     /// 仅刷 BufWriter 缓冲到 OS（不做 fsync）：供同会话 read-after-write。
     pub fn flush_buf(&mut self) -> Result<(), StrataError> {
-        self.w.flush()?;
+        let res = match self.w.as_mut() {
+            Some(w) => w.flush(),
+            None => {
+                return Err(StrataError::Io(std::io::Error::other(
+                    "segment writer is dead after unrecoverable write failure",
+                )))
+            }
+        };
+        if let Err(e) = res {
+            self.recover_partial_write();
+            return Err(StrataError::Io(e));
+        }
+        Ok(())
+    }
+
+    /// 刷缓冲并 `sync_data`（数据落盘；文件长度元数据不强制，回放侧有
+    /// 越界条目丢弃兜底）。供 WAL 顺序：段数据先于 epoch 日志持久化。
+    pub fn sync_data(&mut self) -> Result<(), StrataError> {
+        self.flush_buf()?;
+        self.w
+            .as_ref()
+            .expect("flush_buf ensured writer alive")
+            .get_ref()
+            .sync_data()?;
         Ok(())
     }
 
     /// flush 并 fsync 底层文件。
     pub fn fsync(&mut self) -> Result<(), StrataError> {
-        self.w.flush()?;
-        self.w.get_ref().sync_all()?;
+        self.flush_buf()?;
+        self.w
+            .as_ref()
+            .expect("flush_buf ensured writer alive")
+            .get_ref()
+            .sync_all()?;
         Ok(())
     }
 
     /// flush 并关闭写入器。
     pub fn close(mut self) -> Result<(), StrataError> {
-        self.w.flush()?;
-        Ok(())
+        self.flush_buf()
     }
+
+    /// 部分写恢复：BufWriter 出错后其内部缓冲与文件实际长度均不可信。
+    /// 取出底层 File（忽略残量 flush 的报错）、截断回逻辑 offset、
+    /// 重建缓冲并定位到 offset；截断/定位失败则写入器作废（`w = None`），
+    /// 后续 append 报错而不是写坏文件。
+    fn recover_partial_write(&mut self) {
+        let Some(bw) = self.w.take() else { return };
+        let mut file = bw.into_inner().unwrap_or_else(|e| e.into_inner());
+        let ok = file
+            .set_len(self.offset)
+            .and_then(|()| file.seek(SeekFrom::Start(self.offset)))
+            .is_ok();
+        if ok {
+            self.w = Some(BufWriter::new(file));
+        }
+    }
+}
+
+/// 校验段文件头：存在、magic 正确且携带的 seg_id 与 `expected_id` 一致。
+/// 供 epoch 回放认领孤儿段 / 分配段号前探测残留文件使用。
+pub fn segment_header_ok(path: &Path, expected_id: u32) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut hdr = [0u8; SEG_HEADER_SIZE as usize];
+    if f.read_exact(&mut hdr).is_err() {
+        return false;
+    }
+    hdr[0..4] == SEG_MAGIC
+        && u32::from_le_bytes(hdr[4..8].try_into().unwrap()) == expected_id
 }
 
 #[cfg(test)]

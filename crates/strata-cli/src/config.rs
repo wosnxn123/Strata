@@ -4,6 +4,7 @@
 //! - `#` / `!` 开头的整行为注释；
 //! - 行尾 `\` 表示续行（逻辑行行号取首个物理行）；
 //! - 按首个 `=` 分割 key/value，两侧 trim；
+//! - 文件开头 U+FEFF BOM 自动剥离（Windows 记事本产物）；
 //! - 未知 key 忽略（eprintln 告警）；
 //! - 非法值 → [`StrataError::Config`]。
 //!
@@ -33,7 +34,6 @@ strata.compression.hot-enabled=true
 strata.compression.cold-enabled=true
 strata.compression.hot=zstd-3
 strata.compression.cold=zstd-9
-strata.compression.dictionary=true
 # Batch compression workers: 0=auto(all cores) 1=serial(default, TPS-first) N>=2=capped
 # 批量压缩线程：0=自动(全核) 1=串行(默认,TPS优先) N≥2=限N线程
 strata.compression.threads=1
@@ -43,16 +43,39 @@ strata.index.cache-mb=512
 strata.gc.enabled=true
 strata.gc.invalid-threshold=0.6
 strata.gc.budget-bytes=33554432
+# Minimum hole bytes for punch / 挖洞最小洞阈值（字节）
+strata.gc.min-hole-bytes=65536
+# Emergency escape: boot on Anvil even when a vstore exists (data in vstore invisible until converted back)
+# 应急逃生门：vstore 存在时仍按 Anvil 启动（vstore 内数据在转回前不可见）
+strata.force-anvil=false
 ";
 
 /// CLI 侧顶层配置。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StrataConfig {
     /// 是否启用 Strata 存储引擎（false = 回退 Anvil）。
     pub enabled: bool,
     pub tier: TierConfig,
     pub store: StoreConfig,
     pub gc: GcConfig,
+    /// `strata.gc.enabled`：false 时 compact 跳过 GC 阶段（模板默认 true）。
+    pub gc_enabled: bool,
+    /// `strata.force-anvil`：Java 运行时逃生门键；CLI 只解析不使用。
+    pub force_anvil: bool,
+}
+
+impl Default for StrataConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tier: TierConfig::default(),
+            store: StoreConfig::default(),
+            gc: GcConfig::default(),
+            // 与模板取值一致：GC 默认开，逃生门默认关。
+            gc_enabled: true,
+            force_anvil: false,
+        }
+    }
 }
 
 
@@ -75,6 +98,8 @@ impl PartialEq for StrataConfig {
             && self.gc.invalid_threshold == other.gc.invalid_threshold
             && self.gc.budget_bytes == other.gc.budget_bytes
             && self.gc.min_hole_bytes == other.gc.min_hole_bytes
+            && self.gc_enabled == other.gc_enabled
+            && self.force_anvil == other.force_anvil
     }
 }
 
@@ -209,6 +234,8 @@ fn logical_lines(text: &str) -> Vec<(u32, String)> {
 
 /// 解析配置文件全文。
 fn parse(text: &str) -> Result<StrataConfig, StrataError> {
+    // 文件开头可能带 UTF-8 BOM（Windows 记事本），不剥离会让首个键无法识别。
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let logical = logical_lines(text);
 
     // 第一遍：显式 strata.enabled=false → 短路，跳过其余键的校验。
@@ -256,8 +283,12 @@ fn parse(text: &str) -> Result<StrataConfig, StrataError> {
             "strata.compression.cold-enabled" => {
                 cfg.store.cold_enabled = parse_bool(&key, &value, line)?;
             }
+            // 已停用（全链路无生产者无消费者）：仍识别旧配置中的键，校验后告警忽略，不落存储。
             "strata.compression.dictionary" => {
-                cfg.store.dictionary = parse_bool(&key, &value, line)?;
+                parse_bool(&key, &value, line)?;
+                eprintln!(
+                    "WARN: strata.compression.dictionary 已停用（字典压缩未接线），忽略"
+                );
             }
             "strata.compression.threads" => {
                 cfg.store.compression_threads = value.parse::<u32>().map_err(|_| {
@@ -269,9 +300,8 @@ fn parse(text: &str) -> Result<StrataConfig, StrataError> {
                     bad(line, format!("{key}: 无法把 '{value}' 解析为 u64"))
                 })?;
             }
-            // Phase 1 的 GcConfig 没有 enabled 字段：只校验取值合法性，不落存储。
             "strata.gc.enabled" => {
-                parse_bool(&key, &value, line)?;
+                cfg.gc_enabled = parse_bool(&key, &value, line)?;
             }
             "strata.gc.invalid-threshold" => {
                 cfg.gc.invalid_threshold = value.parse::<f64>().map_err(|_| {
@@ -282,6 +312,15 @@ fn parse(text: &str) -> Result<StrataConfig, StrataError> {
                 cfg.gc.budget_bytes = value.parse::<u64>().map_err(|_| {
                     bad(line, format!("{key}: 无法把 '{value}' 解析为 u64"))
                 })?;
+            }
+            "strata.gc.min-hole-bytes" => {
+                cfg.gc.min_hole_bytes = value.parse::<u64>().map_err(|_| {
+                    bad(line, format!("{key}: 无法把 '{value}' 解析为 u64"))
+                })?;
+            }
+            // Java 运行时逃生门：CLI 自身不使用，只解析以免报未知键告警。
+            "strata.force-anvil" => {
+                cfg.force_anvil = parse_bool(&key, &value, line)?;
             }
             other => {
                 eprintln!("WARN: {CONFIG_FILE} 中未知配置项 '{other}'，已忽略");
@@ -306,6 +345,11 @@ mod tests {
         assert!(text.starts_with("# Strata storage configuration"));
         assert!(text.contains("strata.enabled=false"));
         assert!(text.contains("strata.compression.hot=zstd-3"));
+        // 最终模板形态：新增键在位、dictionary 已下线。
+        assert!(text.contains("strata.gc.min-hole-bytes=65536"));
+        assert!(text.contains("strata.force-anvil=false"));
+        assert!(text.contains("strata.gc.enabled=true"));
+        assert!(!text.contains("strata.compression.dictionary"));
 
         // 再次加载：读回模板，显式 enabled=false → 仍是默认配置。
         let cfg2 = load_or_create_template(dir.path()).unwrap();
@@ -357,5 +401,48 @@ mod tests {
         .unwrap();
         let cfg = load_or_create_template(dir.path()).unwrap();
         assert_eq!(cfg, StrataConfig::default());
+    }
+
+    #[test]
+    fn dictionary_key_deprecated_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "strata.enabled=true\nstrata.compression.dictionary=false\n",
+        )
+        .unwrap();
+        // 弃用键只告警不落存储：保持 StoreConfig 默认值。
+        let cfg = load_or_create_template(dir.path()).unwrap();
+        assert_eq!(cfg.store.dictionary, StoreConfig::default().dictionary);
+    }
+
+    #[test]
+    fn gc_and_force_anvil_keys_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "strata.enabled=true\nstrata.gc.enabled=false\n\
+             strata.gc.min-hole-bytes=12345\nstrata.force-anvil=true\n",
+        )
+        .unwrap();
+        let cfg = load_or_create_template(dir.path()).unwrap();
+        assert!(!cfg.gc_enabled);
+        assert_eq!(cfg.gc.min_hole_bytes, 12345);
+        assert!(cfg.force_anvil);
+    }
+
+    #[test]
+    fn min_hole_bytes_rejects_non_u64() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "strata.gc.min-hole-bytes=oops\n",
+        )
+        .unwrap();
+        let err = load_or_create_template(dir.path()).unwrap_err();
+        match err {
+            StrataError::Config { line, .. } => assert_eq!(line, 1),
+            other => panic!("expected Config error, got {other:?}"),
+        }
     }
 }

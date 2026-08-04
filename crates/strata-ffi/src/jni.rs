@@ -12,9 +12,18 @@
 //! 核心逻辑全部复用 `lib.rs` 的 `core_*`（与 C ABI 同一套）；错误写入
 //! thread-local `LAST_ERROR`，可经 `lastErrorNative` 读取。panic 不穿越 JNI
 //! 边界（所有入口以 `catch_unwind` 包裹）。
+//!
+//! 读路径错误语义：`readNative` 失败（含 panic）时抛
+//! `dev.strata.bridge.StrataException` 并返回 NULL；键无记录仅返回 NULL、
+//! 不抛异常——Java 侧据此区分"错误"与"MISS"。其余入口沿用状态码 +
+//! `lastErrorNative`。
+//!
+//! 线程模型：read/write/flush/gc/tier 对同一句柄可并发调用（RwLock
+//! 串行化）；`closeNative` 销毁句柄本身，调用方必须保证无在途操作
+//! （先 quiesce 再 close），close 后句柄永久失效。
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
@@ -49,7 +58,7 @@ struct JNINativeInterface {
     reserved3: usize,
     GetVersion: usize,                          // 4
     DefineClass: usize,                         // 5
-    FindClass: usize,                           // 6
+    FindClass: Option<unsafe extern "system" fn(JniEnv, *const c_char) -> JClass>, // 6
     FromReflectedMethod: usize,                 // 7
     FromReflectedField: usize,                  // 8
     ToReflectedMethod: usize,                   // 9
@@ -57,7 +66,7 @@ struct JNINativeInterface {
     IsAssignableFrom: usize,                    // 11
     ToReflectedField: usize,                    // 12
     Throw: usize,                               // 13
-    ThrowNew: usize,                            // 14
+    ThrowNew: Option<unsafe extern "system" fn(JniEnv, JClass, *const c_char) -> i32>, // 14
     ExceptionOccurred: usize,                   // 15
     ExceptionDescribe: usize,                   // 16
     ExceptionClear: Option<unsafe extern "system" fn(JniEnv)>, // 17
@@ -207,9 +216,9 @@ struct JNINativeInterface {
     SetStaticFloatField: usize,                 // 161
     SetStaticDoubleField: usize,                // 162
     NewString: usize,                           // 163
-    GetStringLength: usize,                     // 164
-    GetStringChars: usize,                      // 165
-    ReleaseStringChars: usize,                  // 166
+    GetStringLength: Option<unsafe extern "system" fn(JniEnv, JString) -> i32>, // 164
+    GetStringChars: Option<unsafe extern "system" fn(JniEnv, JString, *mut u8) -> *const u16>, // 165
+    ReleaseStringChars: Option<unsafe extern "system" fn(JniEnv, JString, *const u16)>, // 166
     NewStringUTF: Option<unsafe extern "system" fn(JniEnv, *const c_char) -> JString>, // 167
     GetStringUTFLength: usize,                  // 168
     GetStringUTFChars: Option<unsafe extern "system" fn(JniEnv, JString, *mut u8) -> *const c_char>, // 169
@@ -291,7 +300,12 @@ macro_rules! assert_jni_index {
 }
 
 assert_jni_index!(GetVersion = 4);
+assert_jni_index!(FindClass = 6);
+assert_jni_index!(ThrowNew = 14);
 assert_jni_index!(ExceptionClear = 17);
+assert_jni_index!(GetStringLength = 164);
+assert_jni_index!(GetStringChars = 165);
+assert_jni_index!(ReleaseStringChars = 166);
 assert_jni_index!(NewStringUTF = 167);
 assert_jni_index!(GetStringUTFChars = 169);
 assert_jni_index!(ReleaseStringUTFChars = 170);
@@ -347,25 +361,31 @@ unsafe fn clear_pending_exception(env: JniEnv) {
 /* JNI 类型转换助手                                                     */
 /* ------------------------------------------------------------------ */
 
-/// jstring（modified UTF-8）→ Rust `String`；NULL/非 UTF-8/VM 失败均 Err。
+/// jstring → Rust `String`：经 `GetStringChars` 取 UTF-16 码元后
+/// `String::from_utf16`。天然支持增补字符（>U+FFFF，如 emoji/扩展 B 汉字）
+/// 与内嵌 NUL；NULL/非法 UTF-16/VM 失败均 Err。
 fn jstring_to_string(env: JniEnv, s: JString) -> Result<String, String> {
     if s.is_null() {
         return Err("null jstring".to_string());
     }
     // SAFETY: env 有效性契约见各导出函数（JVM 约定）。
     let fns = unsafe { functions(env) };
-    let get_chars = slot(&fns.GetStringUTFChars)?;
-    let release_chars = slot(&fns.ReleaseStringUTFChars)?;
-    // SAFETY: s 为非 NULL jstring（上方已校验）；isCopy 传 NULL 表示不关心。
+    let get_len = slot(&fns.GetStringLength)?;
+    let get_chars = slot(&fns.GetStringChars)?;
+    let release_chars = slot(&fns.ReleaseStringChars)?;
+    // SAFETY: s 为非 NULL jstring（上方已校验）。
+    let len = unsafe { get_len(env, s) };
+    let len = usize::try_from(len).map_err(|_| "negative string length".to_string())?;
+    // SAFETY: 同上；isCopy 传 NULL 表示不关心（始终配对释放）。
     let chars = unsafe { get_chars(env, s, ptr::null_mut()) };
     if chars.is_null() {
-        return Err("GetStringUTFChars failed (pending exception or OOM)".to_string());
+        return Err("GetStringChars failed (pending exception or OOM)".to_string());
     }
-    // SAFETY: 返回指针 NUL 结尾，且在 Release 之前读之有效。
-    let text = unsafe { CStr::from_ptr(chars) }
-        .to_str()
-        .map_err(|_| "jstring is not valid modified UTF-8".to_string())
-        .map(|t| t.to_string());
+    // SAFETY: chars 指向 len 个已初始化的 jchar（GetStringChars 契约），
+    // 且在 Release 之前读之有效。
+    let units = unsafe { std::slice::from_raw_parts(chars, len) };
+    let text =
+        String::from_utf16(units).map_err(|_| "jstring is not valid UTF-16".to_string());
     // SAFETY: chars 来自同一 env 对同一 s 的 get_chars。
     unsafe { release_chars(env, s, chars) };
     text
@@ -428,6 +448,48 @@ fn string_to_jstring(env: JniEnv, text: &str) -> Result<JString, String> {
         return Err("NewStringUTF failed (OOM or pending exception)".to_string());
     }
     Ok(s)
+}
+
+/// 抛 `dev.strata.bridge.StrataException`（消息为 modified UTF-8 C 串，
+/// ThrowNew 的约定），尽力而为：FindClass/ThrowNew 任一失败即放弃
+/// （此时 LAST_ERROR 仍保有错误文本）。
+///
+/// 返回后可能已有 Java 异常挂起：调用方必须立即返回 JVM，不得再做任何
+/// JNI 调用。
+fn throw_strata_exception(env: JniEnv, msg: &str) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: env 有效性契约见各导出函数（JVM 约定）。
+        let fns = unsafe { functions(env) };
+        let (Ok(find_class), Ok(throw_new)) = (slot(&fns.FindClass), slot(&fns.ThrowNew))
+        else {
+            return;
+        };
+        // SAFETY: 类名为 NUL 结尾的字节串字面量。
+        let cls = unsafe {
+            find_class(
+                env,
+                b"dev/strata/bridge/StrataException\0"
+                    .as_ptr()
+                    .cast::<c_char>(),
+            )
+        };
+        if cls.is_null() {
+            // 类未加载：NoClassDefFoundError 已挂起，放弃抛异常。
+            return;
+        }
+        let Ok(c_msg) = CString::new(msg) else {
+            return;
+        };
+        // SAFETY: cls 为 FindClass 返回的本地引用；c_msg NUL 结尾。
+        let _ = unsafe { throw_new(env, cls, c_msg.as_ptr()) };
+    }));
+}
+
+/// 记 LAST_ERROR，抛 StrataException，返回 NULL。用于读路径的失败分支。
+fn fail_with_exception(env: JniEnv, msg: String) -> *mut c_void {
+    set_last_error(&msg);
+    throw_strata_exception(env, &msg);
+    ptr::null_mut()
 }
 
 /* ------------------------------------------------------------------ */
@@ -543,8 +605,9 @@ pub extern "system" fn Java_dev_strata_bridge_StrataNative_writeNative(
 }
 
 /// `private static native byte[] readNative(long handle, int x, int z,
-/// short typeId)` → 负载数组；键无记录返回 NULL；错误置 lastErrorNative
-/// 并返回 NULL。
+/// short typeId)` → 负载数组。键无记录返回 NULL（不抛异常，Java 侧按
+/// MISS 处理）；错误（含 panic）写入 LAST_ERROR 并抛
+/// `dev.strata.bridge.StrataException` 后返回 NULL——与"无记录"可区分。
 ///
 /// # Safety
 ///
@@ -560,10 +623,19 @@ pub extern "system" fn Java_dev_strata_bridge_StrataNative_readNative(
 ) -> JByteArray {
     // SAFETY: env 有效性契约见上。
     unsafe { clear_pending_exception(env) };
-    guarded_jobject(move || match core_read(handle as *mut c_void, x, z, type_id as u16)? {
-        Some(data) => vec_to_jbyte_array(env, &data),
-        None => Ok(ptr::null_mut()),
-    })
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        core_read(handle as *mut c_void, x, z, type_id as u16)
+    }));
+    match result {
+        Ok(Ok(Some(data))) => match vec_to_jbyte_array(env, &data) {
+            Ok(arr) => arr,
+            Err(msg) => fail_with_exception(env, msg),
+        },
+        // 无记录：NULL，不抛异常（Java 侧按 MISS 处理）。
+        Ok(Ok(None)) => ptr::null_mut(),
+        Ok(Err(msg)) => fail_with_exception(env, msg),
+        Err(payload) => fail_with_exception(env, format!("panic: {}", panic_message(payload))),
+    }
 }
 
 /// `private static native int flushNative(long handle)` → 状态码。
@@ -643,6 +715,8 @@ pub extern "system" fn Java_dev_strata_bridge_StrataNative_tierNative(
 }
 
 /// `private static native void closeNative(long handle)`；0 句柄为无操作。
+/// 调用方职责：close 前必须保证该句柄上无在途操作（quiesce），
+/// close 后句柄永久失效。
 ///
 /// # Safety
 ///

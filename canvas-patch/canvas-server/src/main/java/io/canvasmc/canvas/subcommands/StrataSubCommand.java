@@ -2,6 +2,7 @@ package io.canvasmc.canvas.subcommands;
 
 import com.mojang.brigadier.Command;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import dev.strata.bridge.StrataException;
 import io.canvasmc.canvas.commands.SubCommand;
 import io.canvasmc.canvas.strata.StrataConfig;
 import io.canvasmc.canvas.strata.StrataConverter;
@@ -48,9 +49,13 @@ public final class StrataSubCommand implements SubCommand {
             .then(Commands.literal("flush")
                 .executes(source -> flush(source.getSource())))
             .then(Commands.literal("convert-to-strata")
-                .executes(source -> convert(source.getSource(), true)))
+                .executes(source -> convert(source.getSource(), true, false))
+                .then(Commands.literal("-f").executes(source -> convert(source.getSource(), true, true)))
+                .then(Commands.literal("--force").executes(source -> convert(source.getSource(), true, true))))
             .then(Commands.literal("convert-to-anvil")
-                .executes(source -> convert(source.getSource(), false)));
+                .executes(source -> convert(source.getSource(), false, false))
+                .then(Commands.literal("-f").executes(source -> convert(source.getSource(), false, true)))
+                .then(Commands.literal("--force").executes(source -> convert(source.getSource(), false, true))));
     }
 
     private static int version(final CommandSourceStack source) {
@@ -94,7 +99,7 @@ public final class StrataSubCommand implements SubCommand {
         return Command.SINGLE_SUCCESS;
     }
 
-    private static int convert(final CommandSourceStack source, final boolean toStrata) {
+    private static int convert(final CommandSourceStack source, final boolean toStrata, final boolean force) {
         final MinecraftServer server = source.getServer();
         for (final ServerLevel level : server.getAllLevels()) {
             if (level.canvas$strataWorld() != null) {
@@ -117,8 +122,8 @@ public final class StrataSubCommand implements SubCommand {
         }
         try {
             final StrataConverter.Report report = toStrata
-                ? StrataConverter.convertToStrata(worldDir, config)
-                : StrataConverter.convertToAnvil(worldDir, config);
+                ? StrataConverter.convertToStrata(worldDir, config, force)
+                : StrataConverter.convertToAnvil(worldDir, config, force);
             if (toStrata) {
                 source.sendSuccess(() -> Component.literal(
                     "Converted " + report.regions() + " regions (" + report.records() + " records) to " + worldDir.resolve("vstore")), false);
@@ -130,11 +135,12 @@ public final class StrataSubCommand implements SubCommand {
                 }
             } else {
                 source.sendSuccess(() -> Component.literal(
-                    "Converted " + report.regions() + " regions (" + report.records() + " records) back to Anvil"), false);
+                    "Converted " + report.regions() + " regions (" + report.records() + " records) back to Anvil"
+                        + (report.legacyRaw() > 0 ? " (" + report.legacyRaw() + " legacy raw records)" : "")), false);
                 source.sendSuccess(() -> Component.literal(
                     "vstore retained at " + worldDir.resolve("vstore") + " - verify, then delete it manually."), false);
             }
-        } catch (final IOException ex) {
+        } catch (final IOException | StrataException ex) {
             StrataWorld.LOGGER.error("Strata conversion failed", ex);
             source.sendFailure(Component.literal("Conversion failed: " + ex.getMessage()));
         }

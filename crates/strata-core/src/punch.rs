@@ -4,16 +4,14 @@
 //! 所有失败路径（文件系统/平台不支持、系统调用报错）都返回
 //! [`PunchOutcome::Unsupported`]，并保证文件内容不变——调用方只需把该区间
 //! 视为"未被回收"即可。
+//!
+//! 调用方（GC）负责把死区间切成 ≤32KB 的子区间逐个挖洞：段扫描器的中部
+//! 坏区重同步窗口为 64KB，≤32KB 的洞保证洞后第一条有效记录的 MAGIC 永远
+//! 落在窗口内（见 `segment::scan_segment`）。
 
 use std::fs::File;
 
 use crate::StrataError;
-
-/// 允许挖洞的最小字节数。
-///
-/// 取自 NTFS 稀疏分配粒度（64 KiB 簇边界）：小于该区间的挖洞在 Windows 上
-/// 无法对齐到可释放的分配单元，因此一律拒绝（返回 `Unsupported`）。
-pub const MIN_HOLE_BYTES: u64 = 64 * 1024;
 
 /// 一次挖洞操作的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,15 +25,17 @@ pub enum PunchOutcome {
 /// 将文件区间 `[offset, offset + len)` 挖洞（释放磁盘空间，之后读回为零）。
 ///
 /// 语义约定：
-/// - `len < MIN_HOLE_BYTES` → 返回 [`PunchOutcome::Unsupported`]，文件内容不变；
+/// - `len == 0` → 返回 [`PunchOutcome::Unsupported`]，文件内容不变；
 /// - 平台不支持（无 `fallocate(FALLOC_FL_PUNCH_HOLE)`、卷不支持稀疏归零等）
 ///   → [`PunchOutcome::Unsupported`]；
+/// - Linux 上 `fallocate` 要求区间按文件系统块对齐：实现向内收缩到块边界
+///   （绝不外扩触碰区间外的活数据），收缩后为空同样返回 `Unsupported`；
 /// - 任何其他系统调用错误同样归为 [`PunchOutcome::Unsupported`]，不向上传播
 ///   ——挖洞只是优化，失败时保留数据永远比报错更安全；
 /// - 仅当 `offset + len` 溢出 `u64` 时返回 [`StrataError::Io`]（非法参数，
 ///   文件内容同样不变）。
 pub fn punch_hole(file: &mut File, offset: u64, len: u64) -> Result<PunchOutcome, StrataError> {
-    if len < MIN_HOLE_BYTES {
+    if len == 0 {
         return Ok(PunchOutcome::Unsupported);
     }
     // offset + len 溢出 u64 视为非法参数（文件内容不变）；
@@ -70,14 +70,37 @@ mod unix {
 
     /// Linux/macOS 上通过 `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`
     /// 挖洞；任何 errno 都按"内容不变"原则映射为 `Unsupported`。
+    ///
+    /// 许多文件系统要求 offset/len 对齐到文件系统块，未对齐参数直接 EINVAL。
+    /// 这里先探测块大小并把区间**向内**收缩到块边界（外扩会归零区间外的活
+    /// 数据），收缩后为空则视为不支持。
     pub(super) fn punch(file: &mut File, offset: u64, len: u64) -> Result<PunchOutcome, StrataError> {
         let fd = file.as_raw_fd();
+
+        let block = {
+            let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+            let bsize = if unsafe { libc::fstatfs(fd, &mut fs) } == 0 && fs.f_bsize > 0 {
+                fs.f_bsize as u64
+            } else {
+                4096
+            };
+            bsize.max(1)
+        };
+
+        // punch_hole 已保证 offset + len 不溢出。
+        let end = offset + len;
+        let start = offset.next_multiple_of(block);
+        let aligned_end = end / block * block;
+        if aligned_end <= start {
+            return Ok(PunchOutcome::Unsupported);
+        }
+
         let rc = unsafe {
             libc::fallocate(
                 fd,
                 libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                offset as libc::off_t,
-                len as libc::off_t,
+                start as libc::off_t,
+                (aligned_end - start) as libc::off_t,
             )
         };
         if rc == 0 {
@@ -200,36 +223,34 @@ mod tests {
     }
 
     #[test]
-    fn too_small_hole_rejected() {
+    fn zero_length_hole_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.bin");
         std::fs::write(&path, vec![0u8; 128 * 1024]).unwrap();
         let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         assert!(matches!(
-            punch_hole(&mut f, 0, 4096).unwrap(),
+            punch_hole(&mut f, 0, 0).unwrap(),
             PunchOutcome::Unsupported
         ));
     }
 
     #[test]
-    fn exact_minimum_boundary_is_attempted() {
-        // len == MIN_HOLE_BYTES 不应在阈值检查处被拒，而是真正尝试挖洞
-        // （结果取决于文件系统，二者皆合法，但内容语义必须符合结果）。
+    fn small_hole_is_attempted() {
+        // 不再有 64KB 最小门槛（GC 按 ≤32KB 子区间挖洞）：小区间同样应真正
+        // 尝试挖洞，结果取决于文件系统，但内容语义必须符合结果。
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.bin");
-        std::fs::write(&path, vec![0x5Au8; 3 * MIN_HOLE_BYTES as usize]).unwrap();
+        std::fs::write(&path, vec![0x5Au8; 128 * 1024]).unwrap();
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
-        let r = punch_hole(&mut f, MIN_HOLE_BYTES, MIN_HOLE_BYTES).unwrap();
+        let r = punch_hole(&mut f, 32 * 1024, 32 * 1024).unwrap();
         let data = std::fs::read(&path).unwrap();
         match r {
             PunchOutcome::Done => assert!(
-                data[MIN_HOLE_BYTES as usize..2 * MIN_HOLE_BYTES as usize]
-                    .iter()
-                    .all(|&b| b == 0)
+                data[32 * 1024..64 * 1024].iter().all(|&b| b == 0)
             ),
             PunchOutcome::Unsupported => assert!(data.iter().all(|&b| b == 0x5A)),
         }

@@ -21,6 +21,11 @@ const SECTOR: usize = 4096;
 const HEADER_SIZE: usize = 2 * SECTOR;
 const ENTRIES: usize = 1024;
 
+/// Hard cap on decompressed bytes for a single chunk (256 MiB). Vanilla chunks
+/// decompress to far less than this (typically a few MiB at most); the cap only
+/// guards against decompression bombs from corrupt or malicious region files.
+pub const MAX_CHUNK_DECOMPRESSED: usize = 256 * 1024 * 1024;
+
 /// Version bytes for chunk compression schemes.
 const VER_GZIP: u8 = 1;
 const VER_DEFLATE: u8 = 2;
@@ -73,6 +78,12 @@ pub fn read_region(path: &Path) -> anyhow::Result<Vec<ChunkLoc>> {
         if count == 0 {
             continue;
         }
+        if offset < 2 {
+            bail!(
+                "chunk at index {} points to sector {offset} inside the file header",
+                index
+            );
+        }
 
         let start = offset * SECTOR;
         let end = start + count * SECTOR;
@@ -86,8 +97,16 @@ pub fn read_region(path: &Path) -> anyhow::Result<Vec<ChunkLoc>> {
             data[start + 2],
             data[start + 3],
         ]) as usize;
-        if n == 0 || start + 4 + n > data.len() {
-            bail!("chunk at index {} has bad record length {}", index, n);
+        // The record (4-byte length + `n` bytes) must stay inside the slot's
+        // allocated sectors; otherwise a crafted `n` could run past them.
+        if n == 0 || n > count * SECTOR - 5 {
+            bail!(
+                "chunk at index {} has bad record length {n} for a {count}-sector slot",
+                index
+            );
+        }
+        if start + 4 + n > data.len() {
+            bail!("chunk at index {} record runs past end of file", index);
         }
         let version = data[start + 4];
         let payload = &data[start + 5..start + 4 + n];
@@ -99,16 +118,30 @@ pub fn read_region(path: &Path) -> anyhow::Result<Vec<ChunkLoc>> {
         let nbt = match version {
             VER_GZIP => {
                 let mut out = Vec::new();
-                GzDecoder::new(payload)
+                let n_read = GzDecoder::new(payload)
+                    .take(MAX_CHUNK_DECOMPRESSED as u64 + 1)
                     .read_to_end(&mut out)
                     .context("gzip chunk")?;
+                if n_read > MAX_CHUNK_DECOMPRESSED {
+                    bail!(
+                        "gzip chunk at index {} decompresses to more than {MAX_CHUNK_DECOMPRESSED} bytes",
+                        index
+                    );
+                }
                 out
             }
             VER_DEFLATE => {
                 let mut out = Vec::new();
-                ZlibDecoder::new(payload)
+                let n_read = ZlibDecoder::new(payload)
+                    .take(MAX_CHUNK_DECOMPRESSED as u64 + 1)
                     .read_to_end(&mut out)
                     .context("deflate chunk")?;
+                if n_read > MAX_CHUNK_DECOMPRESSED {
+                    bail!(
+                        "deflate chunk at index {} decompresses to more than {MAX_CHUNK_DECOMPRESSED} bytes",
+                        index
+                    );
+                }
                 out
             }
             VER_NONE => payload.to_vec(),
@@ -122,6 +155,12 @@ pub fn read_region(path: &Path) -> anyhow::Result<Vec<ChunkLoc>> {
                     payload[2],
                     payload[3],
                 ]) as usize;
+                if orig_len > MAX_CHUNK_DECOMPRESSED {
+                    bail!(
+                        "lz4 chunk at index {} claims {orig_len} decompressed bytes (cap {MAX_CHUNK_DECOMPRESSED})",
+                        index
+                    );
+                }
                 lz4_flex::block::decompress(&payload[4..], orig_len)
                     .context("lz4 chunk")?
             }
@@ -156,8 +195,18 @@ pub fn write_region(path: &Path, chunks: &[ChunkLoc]) -> anyhow::Result<()> {
         enc.write_all(&chunk.nbt)?;
         let compressed = enc.finish()?;
         // record: u32 BE length + version byte + compressed data
+        let record_len = 4 + 1 + compressed.len();
+        let sectors = record_len.div_ceil(SECTOR);
+        if sectors > 255 {
+            bail!(
+                "chunk ({}, {}) record is {record_len} bytes = {sectors} sectors; \
+                 the Anvil location table can only address up to 255 sectors per chunk",
+                chunk.x,
+                chunk.z
+            );
+        }
         let len = (1 + compressed.len()) as u32;
-        let mut record = Vec::with_capacity(4 + 1 + compressed.len());
+        let mut record = Vec::with_capacity(record_len);
         record.extend_from_slice(&len.to_be_bytes());
         record.push(VER_DEFLATE);
         record.extend_from_slice(&compressed);

@@ -2,24 +2,28 @@
 //!
 //! * 晋升：存活记录全部稳定（最近写距当前 epoch 至少
 //!   [`TierConfig::stable_flushes`] 次 flush）且尚无冷归档的 region，整块
-//!   打包进 `cold/r.{rx}.{rz}.varc`（原始 NBT，信封原样保留），随后从热层
-//!   索引与位图中移除这些键；冷读由 [`crate::store::Store::read`] 的冷查
-//!   路径透明兜底。
-//! * 降级：`invalid_count / total_slots` 超过
+//!   打包进 `cold/r.{rx}.{rz}.varc`（原始 NBT，信封原样保留）。持久化顺序：
+//!   `.varc` 落盘 + fsync → manifest 登记冷区 → 清理热层 `.vix`。崩溃基准 =
+//!   冷已注册：此后回放跳过冷区键（数据在冷归档），此前热层完好。
+//! * 降级：`.varc.inv` 位图 popcount / total_slots 超过
 //!   [`TierConfig::invalid_demote_ratio`] 的冷归档整体解包，未失效槽位逐条
 //!   [`crate::store::Store::write`] 回热层（新 gen），失效槽位已被更新的热
-//!   写覆盖、不得复活旧值；随后删除 `.varc`/`.varc.inv` 与冷区元数据。
+//!   写覆盖、不得复活旧值。顺序：回写热层（进 epoch 日志，期间抑制冷槽失效
+//!   记账）→ manifest 除名并持久化 → 删除 `.varc`/`.varc.inv`（删除失败留待
+//!   下轮，不中止）。
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::cold::{ArchiveBuilder, ArchiveReader};
 use crate::envelope::Envelope;
 use crate::index::{IndexKey, IndexPage, IndexVal, RegionBitmap};
 use crate::manifest::{ColdMeta, RegionKey};
 use crate::segment::scan_segment;
-use crate::store::{cold_path, ix_path, remove_file_with_retry, seg_path, Store, COLD_DIR};
+use crate::store::{
+    cold_path, ix_path, seg_path, write_index_page, MutexExt, Store, COLD_DIR,
+};
 use crate::StrataError;
 
 /// 分层迁移配置。
@@ -102,76 +106,126 @@ impl Store {
     }
 
     /// 降级：失效占比超阈值的冷归档解包回热层并除名。
+    ///
+    /// 判据是 `.varc.inv` 位图的 popcount（[`ArchiveReader::invalid_count`]），
+    /// 不用 manifest 的 `invalid_count`——后者只是记账提示，可能漂移。
     fn demote_pass(&mut self, cfg: &TierConfig, stats: &mut TierStats) -> Result<(), StrataError> {
-        let cands: Vec<ColdMeta> = self
+        let regions: Vec<(i32, i32)> = self
             .manifest
             .cold
             .iter()
-            .filter(|c| {
-                c.total_slots > 0
-                    && (c.invalid_count as f64) / (c.total_slots as f64)
-                        > cfg.invalid_demote_ratio
-            })
-            .cloned()
+            .map(|c| (c.region_x, c.region_z))
             .collect();
 
-        for cm in cands {
-            let path = cold_path(&self.root, cm.region_x, cm.region_z);
-            // 只搬回未被失效的槽位：失效槽位已被更新的热写覆盖，
-            // 以新 gen 写回旧值会让用户写入被静默回滚。
-            let entries = {
-                let mut reader = ctx(ArchiveReader::open(&path), "打开冷归档", &path)?;
-                let mut keep = Vec::new();
-                for (env, nbt) in ctx(reader.extract_all(), "解包冷归档", &path)? {
-                    let visible = ctx(
-                        reader.get(env.chunk_x, env.chunk_z, env.type_id),
-                        "复核冷归档槽位",
-                        &path,
-                    )?;
-                    if visible.is_some() {
-                        keep.push((env, nbt));
-                    }
+        for (rx, rz) in regions {
+            let path = cold_path(&self.root, rx, rz);
+            let mut reader = match ctx(ArchiveReader::open(&path), "打开冷归档", &path) {
+                Ok(r) => r,
+                Err(_) => {
+                    // 已登记但不可读：除名让读路径回落热层，避免 tier_pass
+                    // 永远卡死在坏归档上。文件留给 open 对账清理。
+                    self.unregister_cold(rx, rz)?;
+                    continue;
                 }
-                keep
             };
 
-            // 先除名（manifest + 读取器缓存）再回写：回写的键不会再触发
-            // 冷区失效记账，也避免 Windows 下持有句柄导致文件删不掉。
-            self.manifest
-                .cold
-                .retain(|c| !(c.region_x == cm.region_x && c.region_z == cm.region_z));
-            self.cold_readers.borrow_mut().remove(&RegionKey {
-                x: cm.region_x,
-                z: cm.region_z,
-            });
+            let total = reader.total_slots();
+            let eligible = total > 0
+                && (reader.invalid_count() as f64) / (total as f64)
+                    > cfg.invalid_demote_ratio;
+            if !eligible {
+                continue;
+            }
 
-            for (env, nbt) in entries {
-                self.write(env.chunk_x, env.chunk_z, env.type_id, &nbt)
+            // 只搬回未被失效的槽位：失效槽位已被更新的热写覆盖，
+            // 以新 gen 写回旧值会让用户写入被静默回滚。
+            // 槽位信封校验失败（Corrupt）视为不可见：不回写不可信数据。
+            let mut keep: Vec<(Envelope, Vec<u8>)> = Vec::new();
+            for (env, nbt) in ctx(reader.extract_all(), "解包冷归档", &path)? {
+                match reader.get(env.chunk_x, env.chunk_z, env.type_id) {
+                    Ok(Some(_)) => keep.push((env, nbt)),
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+            }
+            // 关闭句柄：Windows 下持句柄会导致后续删除失败。
+            drop(reader);
+
+            // 顺序第 1 步：回写热层（进 epoch 日志）。期间抑制冷槽失效记账：
+            // 若照常吃记账，崩溃在"回写已进日志、manifest 未除名"窗口时，
+            // 回放跳过冷区键（回写丢失）而槽位已失效——两个副本同时蒸发。
+            self.demote_in_progress = true;
+            let res: Result<(), StrataError> = keep.iter().try_for_each(|(env, nbt)| {
+                self.write(env.chunk_x, env.chunk_z, env.type_id, nbt)
                     .map_err(|e| {
                         StrataError::Manifest(format!(
                             "tier: 降级回写 ({}, {}, type={}) 至热层失败: {e}",
                             env.chunk_x, env.chunk_z, env.type_id
                         ))
-                    })?;
-            }
+                    })
+            });
+            self.demote_in_progress = false;
+            res?;
 
-            // Windows 上杀软/索引器可能短暂锁定文件：删除带重试
-            // （此时本地与缓存的读取器均已 drop，无打开句柄）。
+            // 第 2 步：除名冷区并持久化。此后崩溃回放正常应用热回写
+            // （region 不在 manifest.cold，不再被跳过）。
+            self.manifest
+                .cold
+                .retain(|c| !(c.region_x == rx && c.region_z == rz));
+            self.rebuild_cold_lookup();
+            self.cold_readers
+                .lock()
+                .unwrap_or_poisoned()
+                .remove(&RegionKey { x: rx, z: rz });
+            ctx(
+                self.manifest.save(&self.root),
+                "保存 manifest（降级除名）",
+                &self.root,
+            )?;
+
+            // 第 3 步：删除归档文件。失败留待下轮（open 对账会把孤儿归档
+            // 重新注册，下轮再降级删除），不中止本轮迁移。
             if path.exists() {
-                ctx_io(remove_file_with_retry(&path), "删除冷归档", &path)?;
+                let _ = crate::store::remove_file_with_retry(&path);
             }
             let inv = path.with_extension("varc.inv");
             if inv.exists() {
-                ctx_io(remove_file_with_retry(&inv), "删除冷归档失效位图", &inv)?;
+                let _ = crate::store::remove_file_with_retry(&inv);
             }
             stats.demoted += 1;
         }
 
-        ctx(self.manifest.save(&self.root), "保存 manifest（降级收尾）", &self.root)?;
+        ctx(
+            self.manifest.save(&self.root),
+            "保存 manifest（降级收尾）",
+            &self.root,
+        )?;
+        Ok(())
+    }
+
+    /// 除名一个冷区（manifest + 读取器缓存）并持久化。
+    fn unregister_cold(&mut self, rx: i32, rz: i32) -> Result<(), StrataError> {
+        self.manifest
+            .cold
+            .retain(|c| !(c.region_x == rx && c.region_z == rz));
+        self.rebuild_cold_lookup();
+        self.cold_readers
+            .lock()
+            .unwrap_or_poisoned()
+            .remove(&RegionKey { x: rx, z: rz });
+        ctx(
+            self.manifest.save(&self.root),
+            "保存 manifest（冷区除名）",
+            &self.root,
+        )?;
         Ok(())
     }
 
     /// 晋升：稳定 region 打包为冷归档，并从热层索引/位图移除其键。
+    ///
+    /// 崩溃基准 = 冷已注册：`.varc` 落盘 + fsync 后立即 manifest 登记并
+    /// 保存，之后才清理热层索引。登记后崩溃 → 回放跳过冷区键，数据在冷
+    /// 归档；登记前崩溃 → 热层完好，孤儿 `.varc` 由 open 对账接管。
     fn promote_pass(&mut self, cfg: &TierConfig, stats: &mut TierStats) -> Result<(), StrataError> {
         // 1. 全局最新视图判死活（同 gc），段按 id 升序扫描收集每 region
         //    的存活记录（键 + 原始信封）与最大 epoch_ts。
@@ -229,10 +283,8 @@ impl Store {
             };
             let stable = (ts as u64) + (cfg.stable_flushes as u64) <= self.manifest.epoch;
             let colded = self
-                .manifest
-                .cold
-                .iter()
-                .any(|c| c.region_x == rk.0 && c.region_z == rk.1);
+                .cold_lookup
+                .contains_key(&RegionKey { x: rk.0, z: rk.1 });
             if !stable || colded {
                 continue;
             }
@@ -287,18 +339,31 @@ impl Store {
                 &path,
             )?;
 
-            // 5. 注册冷区并从热层移除全部键。
+            // 5a. 注册冷区并立即持久化（崩溃基准：冷已注册）。
             self.manifest.cold.push(ColdMeta {
                 region_x: rk.0,
                 region_z: rk.1,
                 invalid_count: 0,
                 total_slots: entries,
             });
+            self.rebuild_cold_lookup();
+            ctx(
+                self.manifest.save(&self.root),
+                "保存 manifest（冷区注册）",
+                &self.root,
+            )?;
+
+            // 5b. 从热层移除全部键。中途崩溃：冷基准已确立，未 purge 的键
+            //    热层仍可读（冷归档是它们的备份副本，读路径热优先）。
             self.purge_region_keys(&RegionKey { x: rk.0, z: rk.1 }, &keys)?;
             stats.promoted += 1;
         }
 
-        ctx(self.manifest.save(&self.root), "保存 manifest（晋升收尾）", &self.root)?;
+        ctx(
+            self.manifest.save(&self.root),
+            "保存 manifest（晋升收尾）",
+            &self.root,
+        )?;
         Ok(())
     }
 
@@ -314,12 +379,12 @@ impl Store {
         // 受影响段 = 磁盘页或增量中含该 region 条目者。
         let mut touched: Vec<u32> = Vec::new();
         for (&seg_id, st) in &self.segs {
-            let page_has = ctx(
+            let page = ctx(
                 self.load_page(seg_id),
                 "读段索引页（判定受影响段）",
                 &ix_path(&self.root, seg_id),
-            )?
-            .is_some_and(|p| p.iter().any(|(k, _)| in_region(k)));
+            )?;
+            let page_has = page.is_some_and(|p| p.iter().any(|(k, _)| in_region(k)));
             let inc_has = st.incremental.iter().any(|(k, _)| in_region(k));
             if page_has || inc_has {
                 touched.push(seg_id);
@@ -327,7 +392,8 @@ impl Store {
         }
 
         for seg_id in touched {
-            // 重建磁盘页：过滤掉 region 条目后原子替换（tmp + fsync + rename）。
+            // 重建磁盘页：过滤掉 region 条目后原子覆盖替换（tmp + fsync +
+            // rename，不预删旧文件）。
             let kept: Vec<(IndexKey, IndexVal)> = match ctx(
                 self.load_page(seg_id),
                 "读段索引页（重建）",
@@ -340,21 +406,12 @@ impl Store {
                     .collect(),
                 None => Vec::new(),
             };
-            let new_page = std::sync::Arc::new(IndexPage::from_entries(kept));
-            let bytes = new_page.serialize();
-            let final_path = ix_path(&self.root, seg_id);
-            let tmp_path = final_path.with_extension("vix.tmp");
-            {
-                use std::io::Write;
-                let mut f = ctx_io(File::create(&tmp_path), "创建临时索引页", &tmp_path)?;
-                ctx_io(f.write_all(&bytes), "写临时索引页", &tmp_path)?;
-                ctx_io(f.sync_all(), "fsync 临时索引页", &tmp_path)?;
-            }
-            // Windows 删除带重试（此时 .vix 无打开句柄：页只存在于内存缓存）。
-            if final_path.exists() {
-                ctx_io(remove_file_with_retry(&final_path), "删除旧索引页", &final_path)?;
-            }
-            ctx_io(std::fs::rename(&tmp_path, &final_path), "重命名临时索引页", &final_path)?;
+            let new_page = Arc::new(IndexPage::from_entries(kept));
+            ctx(
+                write_index_page(&self.root, seg_id, &new_page),
+                "替换段索引页",
+                &ix_path(&self.root, seg_id),
+            )?;
 
             // 增量同样过滤；位图无单槽清除，按新页 ∪ 新增量整体重建。
             if let Some(st) = self.segs.get_mut(&seg_id) {
@@ -368,7 +425,7 @@ impl Store {
                 }
                 st.bitmap = bitmap;
             }
-            self.cache.put(seg_id, new_page);
+            self.cache.lock().unwrap_or_poisoned().put(seg_id, new_page);
         }
         Ok(())
     }
