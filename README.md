@@ -96,6 +96,7 @@ strata.gc.budget-bytes=33554432
 
 - [设计规格：Strata 混合双层存储引擎](docs/superpowers/specs/2026-08-04-strata-storage-design.md)
 - [实施计划：strata-core Phase 1](docs/superpowers/plans/2026-08-04-strata-core-phase1.md)
+- [服务端支持状态](docs/SERVER_SUPPORT.md)
 
 ---
 

@@ -1,8 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/strata-core", "crates/strata-cli"]
+members = ["crates/strata-core", "crates/strata-cli", "crates/strata-ffi"]
 
 [workspace.dependencies]
 zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 thiserror = "2"
+rayon = "1"

@@ -1,0 +1,95 @@
+/* strata-ffi — C ABI for the Strata vstore.
+ *
+ * Handles: `void*` returned by strata_open points to a thread-safe store
+ * (RwLock-serialized); pass it back unchanged to every other call and finish
+ * with strata_close.
+ *
+ * Error codes (all int32_t-returning functions):
+ *   0  success
+ *   1  failure — call strata_last_error for details
+ *   2  Rust-side panic, caught at the boundary — details via strata_last_error
+ *   3  strata_read only: the key has no record
+ *
+ * Null pointer arguments yield code 1 ("null pointer"); strata_write accepts
+ * (nbt == NULL, len == 0) as an empty payload. All `char*` inputs must be
+ * NUL-terminated valid UTF-8.
+ *
+ * Buffer ownership: strata_read allocates via Rust's global allocator; free
+ * the returned buffer with strata_read_free(buf, len) — never free()/delete.
+ * strata_last_error / strata_version copy at most len-1 bytes and always
+ * NUL-terminate when len > 0; they return the number of bytes copied
+ * (excluding the terminator) or -1 if buf is NULL.
+ */
+#ifndef STRATA_FFI_H
+#define STRATA_FFI_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Open (or create) a vstore at `root`.
+ * Boolean flags are int32_t: nonzero = enabled.
+ * Returns NULL on failure; see strata_last_error. */
+void* strata_open(const char* root,
+                  int32_t hot_level,
+                  int32_t hot_enabled,
+                  int32_t cold_level,
+                  int32_t cold_enabled,
+                  int32_t dictionary,
+                  uint64_t cache_mb,
+                  uint64_t segment_max_bytes);
+
+/* Write one record (compressed internally). */
+int32_t strata_write(void* h,
+                     int32_t x,
+                     int32_t z,
+                     uint16_t type_id,
+                     const uint8_t* nbt,
+                     size_t len);
+
+/* Read the latest version of a record.
+ * On success (0) the payload is returned in *out_ptr/*out_len and must be
+ * released with strata_read_free. Returns 3 when the key has no record. */
+int32_t strata_read(void* h,
+                    int32_t x,
+                    int32_t z,
+                    uint16_t type_id,
+                    uint8_t** out_ptr,
+                    size_t* out_len);
+
+/* Release a buffer allocated by strata_read. */
+void strata_read_free(uint8_t* buf, size_t len);
+
+/* Flush buffered data, merge incremental indexes, advance the epoch. */
+int32_t strata_flush(void* h);
+
+/* Run one GC pass (whole-segment drop, hole punching, compaction). */
+int32_t strata_gc(void* h,
+                  double invalid_threshold,
+                  uint64_t budget_bytes,
+                  uint64_t min_hole_bytes);
+
+/* Run one tiering pass (hot -> cold promotion / demotion). */
+int32_t strata_tier(void* h,
+                    int32_t enabled,
+                    uint32_t stable_flushes,
+                    double invalid_demote_ratio);
+
+/* Drop the store. `h` is invalid afterwards; NULL is a no-op. */
+void strata_close(void* h);
+
+/* Copy the last error message for this thread into buf (NUL-terminated,
+ * truncated when buf is too small). Returns bytes copied or -1 on NULL buf. */
+int32_t strata_last_error(uint8_t* buf, size_t len);
+
+/* Write "strata-ffi <version>" into buf (same truncation rules). */
+int32_t strata_version(uint8_t* buf, size_t len);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* STRATA_FFI_H */

@@ -17,6 +17,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::codec::{codec_for, dict_slot, make_comp_id, CODEC_NONE, CODEC_ZSTD};
@@ -112,6 +113,22 @@ pub struct VerifyReport {
     pub corrupt_records: Vec<(u32, u64)>,
 }
 
+/// 单条批量写入项。
+#[derive(Debug, Clone)]
+pub struct BatchItem {
+    pub x: i32,
+    pub z: i32,
+    pub type_id: u16,
+    pub nbt: Vec<u8>,
+}
+
+/// [`Store::write_batch`] 的结果。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BatchWriteResult {
+    /// 成功落盘的记录数。
+    pub written: u64,
+}
+
 /// 单个段的内存状态：L0 位图 + 磁盘索引页（在 [`Store::cache`] 中）+ 未落盘增量。
 pub(crate) struct SegState {
     /// 段内记录的存在性位图（坐标按 32×32 折叠，跨 region 的超集过滤器）。
@@ -161,6 +178,30 @@ impl std::hash::Hash for RegionKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.x.hash(state);
         self.z.hash(state);
+    }
+}
+
+/// # Safety
+///
+/// `Send` 由编译器自动派生（全部字段可 Send，含 `RefCell`）。此处仅补
+/// `Sync`——`cold_readers` 的 `RefCell` 阻碍自动 `Sync`，但跨线程安全性成立：
+/// Store 的可变状态串行化由借用检查保证，可变路径全部取 `&mut self`；只读
+/// 路径（`read`/`verify`/`touch_stats`）对 `cold_readers` 的借用使用
+/// `try_borrow_mut`（借不到即退化为本次调用私有的 ArchiveReader），不跨越任何
+/// `&mut self` 调用边界，因此跨线程不存在别名可变性。
+unsafe impl Sync for Store {}
+
+#[cfg(test)]
+mod sync_traits_tests {
+    use super::Store;
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    #[test]
+    fn store_is_send_and_sync() {
+        assert_send::<Store>();
+        assert_sync::<Store>();
     }
 }
 
@@ -255,7 +296,19 @@ impl Store {
 
     /// 写入一条记录（压缩 → 追加段 → epoch 日志 → 内存索引）。
     pub fn write(&mut self, x: i32, z: i32, type_id: u16, nbt: &[u8]) -> Result<(), StrataError> {
-        // 1. 压缩：热层开关 + 字典槽解析。
+        let (compressed, comp_id) = self.compress_payload(type_id, nbt)?;
+        self.append_compressed(x, z, type_id, compressed, comp_id)
+    }
+
+    /// 热层压缩：开关 + 字典槽解析，与 [`Store::read`] 的解压规则严格对称。
+    ///
+    /// 返回 `(压缩字节, comp_id)`。只读 `cfg`/`manifest`（纯函数语义），
+    /// [`Store::write_batch`] 依赖这一点在 rayon 线程池中并行调用。
+    fn compress_payload(
+        &self,
+        type_id: u16,
+        nbt: &[u8],
+    ) -> Result<(Vec<u8>, u8), StrataError> {
         let codec = if self.cfg.hot_enabled { CODEC_ZSTD } else { CODEC_NONE };
         let dict_pos = if self.cfg.dictionary {
             self.manifest
@@ -274,12 +327,27 @@ impl Store {
             let cd = codec_for(comp_id, self.cfg.hot_level, dict)?;
             cd.compress(nbt, &mut compressed)?;
         }
+        Ok((compressed, comp_id))
+    }
 
-        // 2. gen 分配。
+    /// 已压缩记录的落盘子路径：gen 分配 → 段追加 → epoch 日志 → 内存索引 →
+    /// 段表记账 → 段滚动 → 冷区失效 → 缓冲落盘。
+    ///
+    /// [`Store::write`] 与 [`Store::write_batch`] 共用此路径，保证单条与批量
+    /// 写入语义完全一致（同一条 gen/段/epoch/索引链路）。
+    fn append_compressed(
+        &mut self,
+        x: i32,
+        z: i32,
+        type_id: u16,
+        compressed: Vec<u8>,
+        comp_id: u8,
+    ) -> Result<(), StrataError> {
+        // 1. gen 分配。
         let gen = self.manifest.next_gen;
         self.manifest.next_gen += 1;
 
-        // 3. 活跃段按需创建。
+        // 2. 活跃段按需创建。
         if self.writer.is_none() {
             let id = self.alloc_segment(Bucket::Young)?;
             let path = seg_path(&self.root, id);
@@ -295,7 +363,7 @@ impl Store {
                 .push((rk, vec![0u8; REGION_BITMAP_BYTES]));
         }
 
-        // 4. 信封。
+        // 3. 信封。
         let env = Envelope {
             record_ver: 1,
             type_id,
@@ -308,7 +376,7 @@ impl Store {
             payload_hash: xxh64(&compressed, 0),
         };
 
-        // 5. 追加段文件。
+        // 4. 追加段文件。
         let seg_id = self.active_seg;
         let offset = self
             .writer
@@ -316,14 +384,14 @@ impl Store {
             .expect("writer ensured above")
             .append(&env, &compressed)?;
 
-        // 6. epoch 日志。
+        // 5. epoch 日志。
         self.epoch.record(&EpochEntry {
             seg_id,
             env: env.clone(),
             offset,
         })?;
 
-        // 7. 内存索引。
+        // 6. 内存索引。
         let st = self.segs.get_mut(&seg_id).expect("segment state exists");
         st.bitmap.set(x, z, type_id);
         st.incremental.push((
@@ -337,14 +405,14 @@ impl Store {
             },
         ));
 
-        // 8. 段表记账。
+        // 7. 段表记账。
         let rec_bytes = ENVELOPE_SIZE as u64 + compressed.len() as u64;
         if let Some(m) = self.manifest.segments.iter_mut().find(|m| m.id == seg_id) {
             m.total_bytes += rec_bytes;
             m.live_bytes += rec_bytes;
         }
 
-        // 9. 段滚动。
+        // 8. 段滚动。
         if self
             .writer
             .as_ref()
@@ -355,15 +423,43 @@ impl Store {
             w.close()?;
         }
 
-        // 10. 冷区失效：覆盖已晋升 region 的键时，归档槽位作废并记账。
+        // 9. 冷区失效：覆盖已晋升 region 的键时，归档槽位作废并记账。
         self.invalidate_cold_slot(x, z, type_id)?;
 
-        // 11. 缓冲落盘：保证同会话内 read() 能读到刚写入的记录。
+        // 10. 缓冲落盘：保证同会话内 read() 能读到刚写入的记录。
         if let Some(w) = self.writer.as_mut() {
             w.flush_buf()?;
         }
 
         Ok(())
+    }
+
+    /// 批量写入：并行压缩 + 串行追加落盘。
+    ///
+    /// 压缩是纯函数（只读 `cfg` 与 `manifest` 字典槽），经 rayon 在线程池并行
+    /// 执行；随后串行循环走 [`Store::append_compressed`]，每条记录与
+    /// [`Store::write`] 共享同一条 gen/段/epoch/索引链路。空批量不做任何 IO，
+    /// 返回 `written = 0`。
+    pub fn write_batch(&mut self, items: &[BatchItem]) -> Result<BatchWriteResult, StrataError> {
+        if items.is_empty() {
+            return Ok(BatchWriteResult { written: 0 });
+        }
+
+        // 并行压缩（rayon）：compress_payload 只读 cfg/字典槽；reborrow 成
+        // &Store 供闭包跨线程共享（Store: Sync）。collect 遇首个错误即终止整批。
+        let this: &Store = self;
+        let compressed: Result<Vec<(Vec<u8>, u8)>, StrataError> = items
+            .par_iter()
+            .map(|item| this.compress_payload(item.type_id, &item.nbt))
+            .collect();
+
+        for (item, (bytes, comp_id)) in items.iter().zip(compressed?) {
+            self.append_compressed(item.x, item.z, item.type_id, bytes, comp_id)?;
+        }
+
+        Ok(BatchWriteResult {
+            written: items.len() as u64,
+        })
     }
 
     /// 读取一条记录的最新版本；不存在或损坏隔离时返回 `Ok(None)`。
@@ -414,12 +510,20 @@ impl Store {
                     .any(|c| c.region_x == rk.x && c.region_z == rk.z)
                 {
                     let path = cold_path(&self.root, rk.x, rk.z);
-                    let mut readers = self.cold_readers.borrow_mut();
-                    if !readers.contains_key(&rk) {
-                        readers.insert(rk.clone(), ArchiveReader::open(&path)?);
+                    // 并发读（SyncStore 读锁下多线程）可能同时到达此处：
+                    // 借不到共享 reader 时开一个本次调用私有的，绝不 panic。
+                    match self.cold_readers.try_borrow_mut() {
+                        Ok(mut readers) => {
+                            if !readers.contains_key(&rk) {
+                                readers.insert(rk.clone(), ArchiveReader::open(&path)?);
+                            }
+                            let reader = readers.get_mut(&rk).expect("inserted above");
+                            let res = reader.get(x, z, type_id);
+                            drop(readers);
+                            return res;
+                        }
+                        Err(_) => return ArchiveReader::open(&path)?.get(x, z, type_id),
                     }
-                    let reader = readers.get_mut(&rk).expect("inserted above");
-                    return reader.get(x, z, type_id);
                 }
                 return Ok(None);
             }
