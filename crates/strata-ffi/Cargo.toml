@@ -11,3 +11,8 @@ strata-core = { path = "../strata-core" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# JNI 导出符号层（Java_dev_strata_bridge_StrataNative_*）；默认关闭，
+# 需要 DLL/SO 供 JVM 加载时以 `cargo build -p strata-ffi --features jni` 启用。
+jni = []

@@ -27,9 +27,9 @@ use strata_core::sync_store::SyncStore;
 use strata_core::tier::TierConfig;
 
 /// 成功。
-const OK: i32 = 0;
+pub(crate) const OK: i32 = 0;
 /// 失败（详情见 strata_last_error）。
-const ERR: i32 = 1;
+pub(crate) const ERR: i32 = 1;
 /// Rust 侧 panic，已在边界捕获。
 const PANIC: i32 = 2;
 /// strata_read 专用：键无记录。
@@ -39,7 +39,7 @@ thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-fn set_last_error(msg: impl AsRef<str>) {
+pub(crate) fn set_last_error(msg: impl AsRef<str>) {
     LAST_ERROR.with(|e| {
         let mut e = e.borrow_mut();
         e.clear();
@@ -47,7 +47,7 @@ fn set_last_error(msg: impl AsRef<str>) {
     });
 }
 
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
+pub(crate) fn panic_message(payload: Box<dyn Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         return s.to_string();
     }
@@ -58,7 +58,7 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 }
 
 /// 运行闭包，把 `Result`/panic 归一到 C 错误码。
-fn guarded_i32(f: impl FnOnce() -> Result<i32, String>) -> i32 {
+pub(crate) fn guarded_i32(f: impl FnOnce() -> Result<i32, String>) -> i32 {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(code)) => code,
         Ok(Err(msg)) => {
@@ -119,6 +119,140 @@ unsafe fn handle(h: *mut c_void) -> Result<&'static SyncStore, String> {
     Ok(&*(h as *const SyncStore))
 }
 
+/// 构造 [`StoreConfig`]（布尔位按 C 约定：非 0 = 启用）。
+fn config_from_parts(
+    hot_level: i32,
+    hot_enabled: i32,
+    cold_level: i32,
+    cold_enabled: i32,
+    dictionary: i32,
+    cache_mb: u64,
+    segment_max_bytes: u64,
+) -> StoreConfig {
+    StoreConfig {
+        hot_level,
+        hot_enabled: hot_enabled != 0,
+        cold_level,
+        cold_enabled: cold_enabled != 0,
+        dictionary: dictionary != 0,
+        cache_mb,
+        segment_max_bytes,
+    }
+}
+
+/// 打开（或创建）`root` 处的 vstore，返回堆上句柄。C ABI 与 JNI 共用。
+// 两套 ABI 共用同一组参数，不做拆分。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn core_open(
+    root: &str,
+    hot_level: i32,
+    hot_enabled: i32,
+    cold_level: i32,
+    cold_enabled: i32,
+    dictionary: i32,
+    cache_mb: u64,
+    segment_max_bytes: u64,
+) -> Result<*mut c_void, String> {
+    let cfg = config_from_parts(
+        hot_level,
+        hot_enabled,
+        cold_level,
+        cold_enabled,
+        dictionary,
+        cache_mb,
+        segment_max_bytes,
+    );
+    let store = SyncStore::open(Path::new(root), cfg).map_err(|e| e.to_string())?;
+    Ok(Box::into_raw(Box::new(store)) as *mut c_void)
+}
+
+/// 写入一条记录（payload 为不透明字节，内部压缩）。C ABI 与 JNI 共用。
+pub(crate) fn core_write(
+    h: *mut c_void,
+    x: i32,
+    z: i32,
+    type_id: u16,
+    nbt: &[u8],
+) -> Result<(), String> {
+    // SAFETY: 句柄有效性契约见 `handle`。
+    let store = unsafe { handle(h)? };
+    store.write(x, z, type_id, nbt).map_err(|e| e.to_string())
+}
+
+/// 读取最新版本；键不存在 → `None`。C ABI 与 JNI 共用。
+pub(crate) fn core_read(
+    h: *mut c_void,
+    x: i32,
+    z: i32,
+    type_id: u16,
+) -> Result<Option<Vec<u8>>, String> {
+    // SAFETY: 句柄有效性契约见 `handle`。
+    let store = unsafe { handle(h)? };
+    store.read(x, z, type_id).map_err(|e| e.to_string())
+}
+
+/// 落盘：fsync 活跃段 → 合并增量索引 → 推进 epoch → 保存 manifest。
+pub(crate) fn core_flush(h: *mut c_void) -> Result<(), String> {
+    // SAFETY: 句柄有效性契约见 `handle`。
+    let store = unsafe { handle(h)? };
+    store.flush().map_err(|e| e.to_string())
+}
+
+/// 一轮 GC：整段删除 → hole-punch → 打分压实。
+pub(crate) fn core_gc(
+    h: *mut c_void,
+    invalid_threshold: f64,
+    budget_bytes: u64,
+    min_hole_bytes: u64,
+) -> Result<(), String> {
+    // SAFETY: 句柄有效性契约见 `handle`。
+    let store = unsafe { handle(h)? };
+    let cfg = GcConfig {
+        invalid_threshold,
+        budget_bytes,
+        min_hole_bytes,
+    };
+    store.gc_pass(&cfg).map_err(|e| e.to_string())
+}
+
+/// 一轮分层迁移：热 → 冷晋升 / 解包降级。
+pub(crate) fn core_tier(
+    h: *mut c_void,
+    enabled: i32,
+    stable_flushes: u32,
+    invalid_demote_ratio: f64,
+) -> Result<(), String> {
+    // SAFETY: 句柄有效性契约见 `handle`。
+    let store = unsafe { handle(h)? };
+    let cfg = TierConfig {
+        enabled: enabled != 0,
+        stable_flushes,
+        invalid_demote_ratio,
+    };
+    store.tier_pass(&cfg).map_err(|e| e.to_string())
+}
+
+/// 关闭并释放 store；NULL 为无操作。之后句柄不得再使用。
+pub(crate) fn core_close(h: *mut c_void) {
+    if h.is_null() {
+        return;
+    }
+    // SAFETY: h 由 core_open 经 Box::into_raw 创建，且仅此一处回收。
+    unsafe {
+        drop(Box::from_raw(h as *mut SyncStore));
+    }
+}
+
+/// 版本字符串（C ABI 与 JNI 共用）。
+pub(crate) fn core_version() -> &'static str {
+    concat!("strata-ffi ", env!("CARGO_PKG_VERSION"))
+}
+
+/// 读取本线程最近一次错误信息的副本。
+pub(crate) fn last_error_message() -> String {
+    LAST_ERROR.with(|e| e.borrow().clone())
+}
+
 /// 打开（或创建）`root` 处的 vstore；失败返回 NULL（详情 strata_last_error）。
 /// 布尔开关以 i32 传入：非 0 = 启用。
 ///
@@ -147,17 +281,16 @@ pub extern "C" fn strata_open(
         let path = path
             .to_str()
             .map_err(|_| "root is not valid UTF-8".to_string())?;
-        let cfg = StoreConfig {
+        core_open(
+            path,
             hot_level,
-            hot_enabled: hot_enabled != 0,
+            hot_enabled,
             cold_level,
-            cold_enabled: cold_enabled != 0,
-            dictionary: dictionary != 0,
+            cold_enabled,
+            dictionary,
             cache_mb,
             segment_max_bytes,
-        };
-        let store = SyncStore::open(Path::new(path), cfg).map_err(|e| e.to_string())?;
-        Ok(Box::into_raw(Box::new(store)) as *mut c_void)
+        )
     })
 }
 
@@ -176,8 +309,6 @@ pub extern "C" fn strata_write(
     len: usize,
 ) -> i32 {
     guarded_i32(move || {
-        // SAFETY: 句柄有效性契约见 `handle`。
-        let store = unsafe { handle(h)? };
         let data: &[u8] = if nbt.is_null() {
             if len != 0 {
                 return Err("null pointer".to_string());
@@ -187,7 +318,7 @@ pub extern "C" fn strata_write(
             // SAFETY: 调用方保证 nbt 指向至少 len 个已初始化字节（见上）。
             unsafe { std::slice::from_raw_parts(nbt, len) }
         };
-        store.write(x, z, type_id, data).map_err(|e| e.to_string())?;
+        core_write(h, x, z, type_id, data)?;
         Ok(OK)
     })
 }
@@ -211,9 +342,7 @@ pub extern "C" fn strata_read(
         if out_ptr.is_null() || out_len.is_null() {
             return Err("null pointer".to_string());
         }
-        // SAFETY: 句柄有效性契约见 `handle`。
-        let store = unsafe { handle(h)? };
-        match store.read(x, z, type_id).map_err(|e| e.to_string())? {
+        match core_read(h, x, z, type_id)? {
             Some(data) => {
                 // 经 Box<[u8]> 转交所有权（等价于 into_raw_parts，但稳定 API）：
                 // into_boxed_slice 已把容量压实到 len，free 侧按 (ptr, len) 还原。
@@ -266,9 +395,7 @@ pub extern "C" fn strata_read_free(buf: *mut u8, len: usize) {
 #[no_mangle]
 pub extern "C" fn strata_flush(h: *mut c_void) -> i32 {
     guarded_i32(move || {
-        // SAFETY: 句柄有效性契约见 `handle`。
-        let store = unsafe { handle(h)? };
-        store.flush().map_err(|e| e.to_string())?;
+        core_flush(h)?;
         Ok(OK)
     })
 }
@@ -286,14 +413,7 @@ pub extern "C" fn strata_gc(
     min_hole_bytes: u64,
 ) -> i32 {
     guarded_i32(move || {
-        // SAFETY: 句柄有效性契约见 `handle`。
-        let store = unsafe { handle(h)? };
-        let cfg = GcConfig {
-            invalid_threshold,
-            budget_bytes,
-            min_hole_bytes,
-        };
-        store.gc_pass(&cfg).map_err(|e| e.to_string())?;
+        core_gc(h, invalid_threshold, budget_bytes, min_hole_bytes)?;
         Ok(OK)
     })
 }
@@ -311,14 +431,7 @@ pub extern "C" fn strata_tier(
     invalid_demote_ratio: f64,
 ) -> i32 {
     guarded_i32(move || {
-        // SAFETY: 句柄有效性契约见 `handle`。
-        let store = unsafe { handle(h)? };
-        let cfg = TierConfig {
-            enabled: enabled != 0,
-            stable_flushes,
-            invalid_demote_ratio,
-        };
-        store.tier_pass(&cfg).map_err(|e| e.to_string())?;
+        core_tier(h, enabled, stable_flushes, invalid_demote_ratio)?;
         Ok(OK)
     })
 }
@@ -330,15 +443,7 @@ pub extern "C" fn strata_tier(
 /// `h` 必须是 [`strata_open`] 返回的句柄或 NULL，且未被释放过。
 #[no_mangle]
 pub extern "C" fn strata_close(h: *mut c_void) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        if h.is_null() {
-            return;
-        }
-        // SAFETY: h 由 strata_open 经 Box::into_raw 创建，且仅此一处回收。
-        unsafe {
-            drop(Box::from_raw(h as *mut SyncStore));
-        }
-    }));
+    let _ = catch_unwind(AssertUnwindSafe(|| core_close(h)));
 }
 
 /// 复制本线程最近一次错误信息到 `buf`（NUL 结尾，不足截断）。
@@ -349,7 +454,7 @@ pub extern "C" fn strata_close(h: *mut c_void) {
 /// `buf` 非 NULL 时必须指向至少 `len` 个可写字节。
 #[no_mangle]
 pub extern "C" fn strata_last_error(buf: *mut u8, len: usize) -> i32 {
-    let msg = match catch_unwind(AssertUnwindSafe(|| LAST_ERROR.with(|e| e.borrow().clone()))) {
+    let msg = match catch_unwind(AssertUnwindSafe(last_error_message)) {
         Ok(m) => m,
         Err(_) => return -1,
     };
@@ -365,8 +470,11 @@ pub extern "C" fn strata_last_error(buf: *mut u8, len: usize) -> i32 {
 #[no_mangle]
 pub extern "C" fn strata_version(buf: *mut u8, len: usize) -> i32 {
     // SAFETY: buf/len 契约同 `copy_to_buffer`。
-    copy_to_buffer(concat!("strata-ffi ", env!("CARGO_PKG_VERSION")), buf, len)
+    copy_to_buffer(core_version(), buf, len)
 }
+
+#[cfg(feature = "jni")]
+mod jni;
 
 #[cfg(test)]
 mod tests {

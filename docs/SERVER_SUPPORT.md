@@ -6,8 +6,9 @@ Strata 对 Minecraft 服务端各端的支持状态一览。
 | --- | --- | --- |
 | strata-core 存储引擎（Rust） | ✅ 已完成 | 段日志热层 + 分块冷归档 + 三层索引 + 三档 GC，CI 双平台全绿（Windows + Linux） |
 | strata-cli 转换器 | ✅ 已完成 | Cesium 式双向转换（覆盖目标、保留源、进度恢复）、verify/compact/stats |
-| Java FFI 插件（JNI 桥） | 🚧 开发中 | Phase 2：strata-ffi C ABI + SyncStore 线程安全门面 |
-| Canvas（自魔改 fork） | 🚧 开发中 | **主集成目标**：[wosnxn123/Canvas](https://github.com/wosnxn123/Canvas)。以内嵌 patch 形式嵌入 fork 构建（与命令方块修复等补丁同一 rebase 流程），Mixin hook Moonrise IO 字节边界 + regionizer 分区多 Store 无锁并发写 |
+| strata-ffi C ABI | ✅ 已完成 | Rust cdylib/staticlib，catch_unwind 全函数，CI 双平台全绿（Linux + Windows 交叉编译 DLL） |
+| JNI 桥接层 | 🚧 开发中 | `Java_dev_strata_bridge_StrataNative_*` 符号层（手写 JNI FFI，零依赖），供 Java 侧加载 native |
+| Canvas（自魔改 fork） | 🚧 开发中 | **主集成目标**：[wosnxn123/Canvas](https://github.com/wosnxn123/Canvas)。weaver feature patch 已生成并构建验证（applyAllPatches + compileJava + createPaperclipJar 全绿），`/strata` 命令与启动转换钩子就绪 |
 | Paper / Folia（上游） | 📋 计划中 | 提供**源代码 + 构建嵌入教程**，供自行 patch 嵌入；运行期效果与 Canvas fork 一致 |
 | Fabric / NeoForge 模组 | 📋 计划中 | 远期模组端适配：复用 vanilla IO 适配层，对标 Cesium 形态 |
 | 其他插件端（Spigot/Arclight 等） | 📋 计划中 | 提供**自构建 + 源代码嵌入构建教程**；Arclight 走 vanilla IO 路径（不支持 Folia，与 modloader 互斥） |
