@@ -67,6 +67,12 @@ impl SegmentWriter {
         self.offset
     }
 
+    /// 仅刷 BufWriter 缓冲到 OS（不做 fsync）：供同会话 read-after-write。
+    pub fn flush_buf(&mut self) -> Result<(), StrataError> {
+        self.w.flush()?;
+        Ok(())
+    }
+
     /// flush 并 fsync 底层文件。
     pub fn fsync(&mut self) -> Result<(), StrataError> {
         self.w.flush()?;

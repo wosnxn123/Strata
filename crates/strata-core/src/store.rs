@@ -343,7 +343,7 @@ impl Store {
 
         // 11. 缓冲落盘：保证同会话内 read() 能读到刚写入的记录。
         if let Some(w) = self.writer.as_mut() {
-            w.flush()?;
+            w.flush_buf()?;
         }
 
         Ok(())
