@@ -124,7 +124,8 @@ public final class StrataWorld {
                 config.coldLevel, config.coldEnabled,
                 config.dictionary,
                 config.cacheMb,
-                config.segmentMaxBytes
+                config.segmentMaxBytes,
+                config.compressionThreads
             );
             if (handle == 0L) {
                 LOGGER.warn("[strata] store open returned null handle for {} ({}), falling back to Anvil",

@@ -31,6 +31,7 @@ strata.compression.cold-enabled=true
 strata.compression.hot=zstd-3
 strata.compression.cold=zstd-9
 strata.compression.dictionary=true
+strata.compression.threads=1
 strata.index.cache-mb=512
 strata.gc.enabled=true
 strata.gc.invalid-threshold=0.6
@@ -63,6 +64,7 @@ impl PartialEq for StrataConfig {
             && self.store.dictionary == other.store.dictionary
             && self.store.cache_mb == other.store.cache_mb
             && self.store.segment_max_bytes == other.store.segment_max_bytes
+            && self.store.compression_threads == other.store.compression_threads
             && self.gc.invalid_threshold == other.gc.invalid_threshold
             && self.gc.budget_bytes == other.gc.budget_bytes
             && self.gc.min_hole_bytes == other.gc.min_hole_bytes
@@ -249,6 +251,11 @@ fn parse(text: &str) -> Result<StrataConfig, StrataError> {
             }
             "strata.compression.dictionary" => {
                 cfg.store.dictionary = parse_bool(&key, &value, line)?;
+            }
+            "strata.compression.threads" => {
+                cfg.store.compression_threads = value.parse::<u32>().map_err(|_| {
+                    bad(line, format!("{key}: 无法把 '{value}' 解析为 u32"))
+                })?;
             }
             "strata.index.cache-mb" => {
                 cfg.store.cache_mb = value.parse::<u64>().map_err(|_| {

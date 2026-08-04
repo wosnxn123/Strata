@@ -22,6 +22,7 @@ import java.util.Properties;
  * strata.compression.hot-enabled=true
  * strata.compression.cold-enabled=true
  * strata.compression.dictionary=true
+ * strata.compression.threads=1             # batch compression workers (default serial)
  * strata.index.cache-mb=512
  * strata.tiering.enabled=true
  * strata.tiering.stable-flushes=30
@@ -44,6 +45,7 @@ public final class StrataConfig {
     public int coldLevel = 9;
     public boolean coldEnabled = true;
     public boolean dictionary = true;
+    public int compressionThreads = 1;
     public long cacheMb = 512;
     public long segmentMaxBytes = 64L * 1024L * 1024L;
     public boolean gcEnabled = true;
@@ -105,6 +107,7 @@ public final class StrataConfig {
                 case "strata.compression.hot-enabled" -> config.hotEnabled = parseBool(config, file, key, value, true);
                 case "strata.compression.cold-enabled" -> config.coldEnabled = parseBool(config, file, key, value, true);
                 case "strata.compression.dictionary" -> config.dictionary = parseBool(config, file, key, value, true);
+                case "strata.compression.threads" -> config.compressionThreads = (int) parseLong(config, file, key, value, config.compressionThreads);
                 case "strata.index.cache-mb" -> config.cacheMb = parseLong(config, file, key, value, config.cacheMb);
                 case "strata.gc.enabled" -> config.gcEnabled = parseBool(config, file, key, value, true);
                 case "strata.gc.invalid-threshold" -> config.gcInvalidThreshold = parseDouble(config, file, key, value, config.gcInvalidThreshold);
@@ -204,6 +207,7 @@ public final class StrataConfig {
         strata.compression.hot=zstd-3
         strata.compression.cold=zstd-9
         strata.compression.dictionary=true
+        strata.compression.threads=1
         strata.index.cache-mb=512
         strata.gc.enabled=true
         strata.gc.invalid-threshold=0.6

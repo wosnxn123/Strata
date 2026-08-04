@@ -32,6 +32,8 @@ extern "C" {
 
 /* Open (or create) a vstore at `root`.
  * Boolean flags are int32_t: nonzero = enabled.
+ * compression_threads: batch-write compression workers — 0 = auto (all
+ * available cores), 1 = serial (default), N >= 2 = bounded to N threads.
  * Returns NULL on failure; see strata_last_error. */
 void* strata_open(const char* root,
                   int32_t hot_level,
@@ -40,7 +42,8 @@ void* strata_open(const char* root,
                   int32_t cold_enabled,
                   int32_t dictionary,
                   uint64_t cache_mb,
-                  uint64_t segment_max_bytes);
+                  uint64_t segment_max_bytes,
+                  int32_t compression_threads);
 
 /* Write one record (compressed internally). */
 int32_t strata_write(void* h,

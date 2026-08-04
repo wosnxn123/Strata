@@ -17,7 +17,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rayon::prelude::*;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::codec::{codec_for, dict_slot, make_comp_id, CODEC_NONE, CODEC_ZSTD};
@@ -88,6 +87,9 @@ pub struct StoreConfig {
     pub cache_mb: u64,
     /// 单个段文件的大小上限（超过后滚动到新段）。
     pub segment_max_bytes: u64,
+    /// 批量写入的压缩工作线程数：`0` = 自动（全部可用核心），
+    /// `1` = 串行（默认，游戏服 TPS 优先），`N ≥ 2` = 限 N 线程。
+    pub compression_threads: u32,
 }
 
 impl Default for StoreConfig {
@@ -100,6 +102,7 @@ impl Default for StoreConfig {
             dictionary: true,
             cache_mb: 512,
             segment_max_bytes: 64 * 1024 * 1024,
+            compression_threads: 1,
         }
     }
 }
@@ -289,7 +292,7 @@ impl Store {
     /// 热层压缩：开关 + 字典槽解析，与 [`Store::read`] 的解压规则严格对称。
     ///
     /// 返回 `(压缩字节, comp_id)`。只读 `cfg`/`manifest`（纯函数语义），
-    /// [`Store::write_batch`] 依赖这一点在 rayon 线程池中并行调用。
+    /// [`Store::write_batch`] 依赖这一点在有界工作线程中并行调用。
     fn compress_payload(
         &self,
         type_id: u16,
@@ -420,32 +423,79 @@ impl Store {
         Ok(())
     }
 
-    /// 批量写入：并行压缩 + 串行追加落盘。
+    /// 批量写入：压缩（串行或有界并行）+ 串行追加落盘。
     ///
-    /// 压缩是纯函数（只读 `cfg` 与 `manifest` 字典槽），经 rayon 在线程池并行
-    /// 执行；随后串行循环走 [`Store::append_compressed`]，每条记录与
-    /// [`Store::write`] 共享同一条 gen/段/epoch/索引链路。空批量不做任何 IO，
-    /// 返回 `written = 0`。
+    /// 压缩是纯函数（只读 `cfg` 与 `manifest` 字典槽），并发度由
+    /// [`StoreConfig::compression_threads`] 控制：`1`（默认）或单条走串行；
+    /// `0`（全部可用核心）/`N ≥ 2` 在 [`std::thread::scope`] 内派生有界
+    /// worker 线程分块压缩——不用 rayon 全局池，避免与游戏线程抢核且可按
+    /// Store 配置限流。随后串行循环走 [`Store::append_compressed`]，每条记录
+    /// 与 [`Store::write`] 共享同一条 gen/段/epoch/索引链路。任一 worker
+    /// 出错即终止整批。空批量不做任何 IO，返回 `written = 0`。
     pub fn write_batch(&mut self, items: &[BatchItem]) -> Result<BatchWriteResult, StrataError> {
         if items.is_empty() {
             return Ok(BatchWriteResult { written: 0 });
         }
 
-        // 并行压缩（rayon）：compress_payload 只读 cfg/字典槽；reborrow 成
-        // &Store 供闭包跨线程共享（Store: Sync）。collect 遇首个错误即终止整批。
-        let this: &Store = self;
-        let compressed: Result<Vec<(Vec<u8>, u8)>, StrataError> = items
-            .par_iter()
-            .map(|item| this.compress_payload(item.type_id, &item.nbt))
-            .collect();
+        let compressed = self.compress_batch(items)?;
 
-        for (item, (bytes, comp_id)) in items.iter().zip(compressed?) {
+        for (item, (bytes, comp_id)) in items.iter().zip(compressed) {
             self.append_compressed(item.x, item.z, item.type_id, bytes, comp_id)?;
         }
 
         Ok(BatchWriteResult {
             written: items.len() as u64,
         })
+    }
+
+    /// [`Store::write_batch`] 的压缩前置：按 [`StoreConfig::compression_threads`]
+    /// 串行或有界并行压缩全部条目，结果与 `items` 同序。
+    fn compress_batch(&self, items: &[BatchItem]) -> Result<Vec<(Vec<u8>, u8)>, StrataError> {
+        let threads = self.cfg.compression_threads;
+        // 串行（默认）或单条：不派生线程。
+        if threads == 1 || items.len() <= 1 {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(self.compress_payload(item.type_id, &item.nbt)?);
+            }
+            return Ok(out);
+        }
+
+        // 并行：`0` = 全部可用核心；否则限 N。worker 数不超过条目数。
+        let want = if threads == 0 {
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        } else {
+            usize::from(threads)
+        };
+        let workers = want.min(items.len());
+        let chunk = items.len().div_ceil(workers);
+
+        // compress_payload 纯函数（&self）；Store: Sync，共享引用可跨线程。
+        let this: &Store = self;
+        let mut compressed: Vec<(Vec<u8>, u8)> = Vec::with_capacity(items.len());
+        std::thread::scope(|scope| -> Result<(), StrataError> {
+            let handles: Vec<_> = items
+                .chunks(chunk)
+                .map(|piece| {
+                    scope.spawn(move || {
+                        let mut out = Vec::with_capacity(piece.len());
+                        for item in piece {
+                            out.push(this.compress_payload(item.type_id, &item.nbt)?);
+                        }
+                        Ok::<_, StrataError>(out)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                // worker panic 视为批量失败（compress_payload 只返回错误，不 panic）。
+                let piece = handle
+                    .join()
+                    .map_err(|_| StrataError::Codec("压缩工作线程 panic".to_string()))?;
+                compressed.extend(piece?);
+            }
+            Ok(())
+        })?;
+        Ok(compressed)
     }
 
     /// 读取一条记录的最新版本；不存在或损坏隔离时返回 `Ok(None)`。

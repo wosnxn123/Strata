@@ -114,18 +114,20 @@ public final class StrataNative {
      * @param dictionary      enable per-type zstd dictionary compression
      * @param cacheMb         page cache budget in MiB
      * @param segmentMaxBytes segment roll size in bytes
+     * @param compressionThreads batch-write compression workers (0 = auto, 1 = serial default, N ≥ 2 = bounded)
      * @return opaque store handle; pass it unchanged to every other call
      * @throws StrataException when the C side returns NULL (see {@link #lastError})
      */
     public static long open(String root, int hotLevel, boolean hotEnabled,
                             int coldLevel, boolean coldEnabled,
-                            boolean dictionary, long cacheMb, long segmentMaxBytes) {
+                            boolean dictionary, long cacheMb, long segmentMaxBytes,
+                            int compressionThreads) {
         if (root == null) {
             throw new StrataException("root must not be null");
         }
         long handle = openNative(root, hotLevel, hotEnabled ? 1 : 0,
                 coldLevel, coldEnabled ? 1 : 0, dictionary ? 1 : 0,
-                cacheMb, segmentMaxBytes);
+                cacheMb, segmentMaxBytes, compressionThreads);
         if (handle == 0L) {
             throw new StrataException("strata_open failed: " + lastError());
         }
@@ -248,11 +250,12 @@ public final class StrataNative {
      * ----------------------------------------------------------------------
      *
      * openNative -> strata_open: C boolean flags are int32_t (nonzero =
-     * enabled); the C void* handle travels as jlong (NULL comes back as 0).
+     * enabled); the C void* handle travels as jlong (NULL comes back as 0);
+     * compressionThreads: 0 = auto, 1 = serial (default), N >= 2 = bounded.
      */
     private static native long openNative(String root, int hotLevel, int hotEnabled,
                                           int coldLevel, int coldEnabled, int dictionary,
-                                          long cacheMb, long segmentMaxBytes);
+                                          long cacheMb, long segmentMaxBytes, int compressionThreads);
 
     /*
      * writeNative -> strata_write: C uint16_t type_id is carried by a Java

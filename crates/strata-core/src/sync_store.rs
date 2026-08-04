@@ -53,7 +53,7 @@ impl SyncStore {
         self.write_lock()?.write(x, z, type_id, nbt)
     }
 
-    /// 批量写入：并行压缩 + 串行落盘（写锁）。
+    /// 批量写入：按配置串行/有界并行压缩 + 串行落盘（写锁）。
     pub fn write_batch(&self, items: &[BatchItem]) -> Result<BatchWriteResult, StrataError> {
         self.write_lock()?.write_batch(items)
     }

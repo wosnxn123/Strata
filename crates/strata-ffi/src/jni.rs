@@ -470,7 +470,9 @@ fn guarded_jstring(f: impl FnOnce() -> Result<JString, String>) -> JString {
 
 /// `private static native long openNative(String root, int hotLevel,
 /// int hotEnabled, int coldLevel, int coldEnabled, int dictionary,
-/// long cacheMb, long segmentMaxBytes)` → 句柄（失败 0，详情 lastErrorNative）。
+/// long cacheMb, long segmentMaxBytes, int compressionThreads)` → 句柄
+/// （失败 0，详情 lastErrorNative）。compressionThreads：0 = 自动（全部可用
+/// 核心）/ 1 = 串行（默认）/ N ≥ 2 = 限 N 线程。
 ///
 /// # Safety
 ///
@@ -488,6 +490,7 @@ pub extern "system" fn Java_dev_strata_bridge_StrataNative_openNative(
     dictionary: i32,
     cache_mb: i64,
     segment_max_bytes: i64,
+    compression_threads: i32,
 ) -> i64 {
     // SAFETY: env 有效性契约见上。
     unsafe { clear_pending_exception(env) };
@@ -502,6 +505,7 @@ pub extern "system" fn Java_dev_strata_bridge_StrataNative_openNative(
             dictionary,
             cache_mb as u64,
             segment_max_bytes as u64,
+            compression_threads,
         )
     }) as i64
 }

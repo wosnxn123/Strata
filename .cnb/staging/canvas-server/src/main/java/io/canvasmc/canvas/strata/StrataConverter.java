@@ -86,7 +86,8 @@ public final class StrataConverter {
                 vstore.toString(),
                 config.hotLevel, config.hotEnabled,
                 config.coldLevel, config.coldEnabled,
-                config.dictionary, config.cacheMb, config.segmentMaxBytes
+                config.dictionary, config.cacheMb, config.segmentMaxBytes,
+                config.compressionThreads
             );
             long regions = 0L;
             long records = 0L;
@@ -139,7 +140,8 @@ public final class StrataConverter {
                 vstore.toString(),
                 config.hotLevel, config.hotEnabled,
                 config.coldLevel, config.coldEnabled,
-                config.dictionary, config.cacheMb, config.segmentMaxBytes
+                config.dictionary, config.cacheMb, config.segmentMaxBytes,
+                config.compressionThreads
             );
             long regions = 0L;
             long records = 0L;

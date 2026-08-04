@@ -78,7 +78,8 @@ fn batch_write_preserves_all() {
 
 #[test]
 fn batch_parallel_faster_than_serial() {
-    // 注意：该断言在多核机器（CI 32 核）上依赖 rayon 并行压缩的显著收益；
+    // 注意：该断言在多核机器（CI 32 核）上依赖并行压缩的显著收益；批量
+    // 路径以 compression_threads=0 显式 opt-in 全核并行（默认串行为主），
     // 核数很少时并行收益可能退化，故用 `<=`（允许平局）而非严格 2x。
     let make_items = || -> Vec<BatchItem> {
         let mut rng = Lcg(0x5EED_5EED_5EED_5EED);
@@ -105,11 +106,15 @@ fn batch_parallel_faster_than_serial() {
         t0.elapsed()
     };
 
-    // 批量路径：write_batch（rayon 并行压缩 + 串行追加）。
+    // 批量路径：write_batch（有界线程并行压缩 + 串行追加，显式 opt-in）。
     let dir_batch = tempfile::tempdir().unwrap();
     let items_batch = make_items();
     let batch = {
-        let mut s = Store::open(dir_batch.path(), StoreConfig::default()).unwrap();
+        let cfg = StoreConfig {
+            compression_threads: 0,
+            ..StoreConfig::default()
+        };
+        let mut s = Store::open(dir_batch.path(), cfg).unwrap();
         let t0 = Instant::now();
         let res = s.write_batch(&items_batch).unwrap();
         s.flush().unwrap();
@@ -137,4 +142,44 @@ fn empty_batch_is_noop() {
     assert_eq!(res.written, 0);
     let r = s.verify().unwrap();
     assert_eq!(r.records, 0);
+}
+
+/// 压缩线程数开关的往返测试：`threads=1`（串行，默认）与 `threads=3`
+/// （有界并行）各写一批，验证记录数且全部可读回。
+#[test]
+fn batch_threads_roundtrip() {
+    for threads in [1u32, 3] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig {
+            compression_threads: threads,
+            ..StoreConfig::default()
+        };
+        let mut s = Store::open(dir.path(), cfg).unwrap();
+
+        let mut rng = Lcg(0xC0FFEE_0DD5 + u64::from(threads));
+        let items: Vec<BatchItem> = (0..512)
+            .map(|_| BatchItem {
+                x: rng.next_i32(),
+                z: rng.next_i32(),
+                type_id: rng.next_u16() % 2,
+                nbt: nbt_payload(rng.next(), 1024),
+            })
+            .collect();
+
+        let res = s.write_batch(&items).unwrap();
+        assert_eq!(res.written, items.len() as u64, "threads={threads}");
+        s.flush().unwrap();
+
+        for it in &items {
+            let got = s.read(it.x, it.z, it.type_id).unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(it.nbt.as_slice()),
+                "threads={threads} mismatch at ({}, {}, {})",
+                it.x,
+                it.z,
+                it.type_id
+            );
+        }
+    }
 }
