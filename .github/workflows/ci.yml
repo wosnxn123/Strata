@@ -69,3 +69,45 @@ jobs:
           name: strata-cli-${{ matrix.os }}
           path: target/release/strata-cli*
           if-no-files-found: ignore
+
+
+  java-bridge:
+    name: Java Bridge
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build native library
+        run: cargo build --release -p strata-ffi
+
+      - name: Stage native library into bridge resources
+        run: cp target/release/libstrata_ffi.so java-bridge/src/main/resources/natives/strata_ffi.so
+
+      - name: Build bridge jar
+        working-directory: java-bridge
+        run: gradle jar
+
+      - name: Upload bridge jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-bridge
+          path: java-bridge/build/libs/java-bridge.jar
