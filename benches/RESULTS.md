@@ -47,13 +47,13 @@ sieve_lookup_10k         time: [163.41 µs 163.53 µs]
 SieveCache 计费严格按页序列化字节，10 万条目下仍远低于 64MB 预算——内存与世界大小无关的性质成立（RSS 采样留待实机长时基准）。
 
 
-### 5. 并行压缩（write_batch，2000 × 8KB 可压缩负载，rayon 并行压缩 + 串行追加）
+### 5. 并行压缩（write_batch，2000 × 8KB 可压缩负载）
 
 ```
-serial = 131.24 ms    batch = 58.38 ms    speedup = 2.25×
+serial = 553.82 ms    batch(threads=0 全核) = 87.00 ms    speedup = 6.37×
 ```
 
-Phase 2 新增：压缩是纯函数，rayon 跨核并行；落盘仍串行保序。32 核机器上 2.25× 加速（数据集 16MB 级，核数未吃满；更大批量收益更高）。
+压缩是纯函数，可跨核并行；落盘仍串行保序。**默认 `compression_threads=1` 串行**（游戏服 TPS 优先），并行是显式 opt-in：`threads=0`=全部可用核、`N≥2`=限 N 线程，用有界 `std::thread::scope` 分块（不走 rayon 全局池，可按 Store 限流、不与游戏线程抢全局池）。上面 6.37× 是 `threads=0` 在 32 核机（AMD EPYC 9K65）空闲时的结果（debug 构建 cargo test 口径；release 绝对值更低，比例同向）。
 
 ## Reproduce
 
