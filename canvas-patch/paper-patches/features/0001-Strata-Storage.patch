@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wosnxn123 <wosnxn123@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 20:11:42 +0800
+Subject: [PATCH] Strata Storage
+
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/Main.java b/src/main/java/org/bukkit/craftbukkit/Main.java
+index 8ce8de8eedfe8557848b0508857744a5b9641239..d4092fb106bdb12b27b49f5e5be382a213874e45 100644
+--- a/src/main/java/org/bukkit/craftbukkit/Main.java
++++ b/src/main/java/org/bukkit/craftbukkit/Main.java
+@@ -50,6 +50,11 @@ public class Main {
+                         .defaultsTo(new File("."))
+                         .describedAs("Directory containing worlds");
+ 
++                // Canvas start - Strata storage one-shot startup conversion
++                this.accepts("strataConvertToStrata", "Convert the overworld from Anvil to the Strata vstore before startup, then continue booting");
++                this.accepts("strataConvertToAnvil", "Convert the overworld from the Strata vstore back to Anvil before startup, then continue booting");
++                // Canvas end - Strata storage one-shot startup conversion
++
+                 this.acceptsAll(asList("w", "world", "level-name"), "World name")
+                         .withRequiredArg()
+                         .ofType(String.class)

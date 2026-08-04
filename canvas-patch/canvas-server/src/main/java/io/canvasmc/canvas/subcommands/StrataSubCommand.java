@@ -65,7 +65,7 @@ public final class StrataSubCommand implements SubCommand {
         source.sendSuccess(() -> Component.literal("Strata native: " + StrataWorld.nativeVersion()), false);
         final Path worldDir = server.storageSource.getLevelDirectory().path();
         for (final ServerLevel level : server.getAllLevels()) {
-            final StrataWorld strata = level.strata$world();
+            final StrataWorld strata = level.canvas$strataWorld();
             if (strata == null) {
                 final boolean configured = Files.isRegularFile(worldDir.resolve(StrataConfig.CONFIG_FILE));
                 source.sendSuccess(() -> Component.literal(
@@ -83,7 +83,7 @@ public final class StrataSubCommand implements SubCommand {
     private static int flush(final CommandSourceStack source) {
         int flushed = 0;
         for (final ServerLevel level : source.getServer().getAllLevels()) {
-            final StrataWorld strata = level.strata$world();
+            final StrataWorld strata = level.canvas$strataWorld();
             if (strata != null) {
                 strata.flush();
                 flushed++;
@@ -97,7 +97,7 @@ public final class StrataSubCommand implements SubCommand {
     private static int convert(final CommandSourceStack source, final boolean toStrata) {
         final MinecraftServer server = source.getServer();
         for (final ServerLevel level : server.getAllLevels()) {
-            if (level.strata$world() != null) {
+            if (level.canvas$strataWorld() != null) {
                 source.sendFailure(Component.literal(
                     "Refusing: Strata is active for " + level.dimension().identifier()
                         + ". Stop the server and use --strataConvertTo" + (toStrata ? "Strata" : "Anvil") + " instead."));

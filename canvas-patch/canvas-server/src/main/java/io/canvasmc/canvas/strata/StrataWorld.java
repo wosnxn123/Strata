@@ -146,7 +146,7 @@ public final class StrataWorld {
                 }
             }
             return store;
-        } catch (final StrataException | IOException | RuntimeException e) {
+        } catch (final IOException | RuntimeException e) { // StrataException is a RuntimeException
             LOGGER.warn("[strata] store unavailable for {}, falling back to Anvil: {}", root, e.getMessage());
             return null;
         }
@@ -169,6 +169,11 @@ public final class StrataWorld {
         return this.vstore;
     }
 
+    /** Snapshot of every open store (server-wide flush / stats). */
+    public static java.util.Collection<StrataWorld> openStores() {
+        return java.util.List.copyOf(REGISTRY.values());
+    }
+
     /** Best-effort total size of the vstore directory in bytes, or -1. */
     public long vstoreBytes() {
         try (final var walk = Files.walk(this.vstore)) {
@@ -184,35 +189,59 @@ public final class StrataWorld {
         }
     }
 
+    /** Outcome of a vstore read. */
+    public enum ReadState {
+        /** Record absent in the vstore — caller falls back to Anvil. */
+        MISS,
+        /** Record present and valid. {@link ReadOutcome#tag()} is the data. */
+        HIT,
+        /** Record is an explicit deletion marker — caller returns NO_DATA. */
+        DELETED
+    }
+
+    /** A vstore read result: {@code state} + the parsed tag when HIT. */
+    public record ReadOutcome(ReadState state, CompoundTag tag) {
+        public static ReadOutcome miss() {
+            return new ReadOutcome(ReadState.MISS, null);
+        }
+
+        public static ReadOutcome hit(final CompoundTag tag) {
+            return new ReadOutcome(ReadState.HIT, tag);
+        }
+
+        public static ReadOutcome deleted() {
+            return new ReadOutcome(ReadState.DELETED, null);
+        }
+    }
+
     /**
-     * Reads one record. Returns {@code null} when the record is absent or
-     * unreadable; an empty tag signals a deletion marker. Store/transport
-     * errors are logged and treated as misses so callers can fall back to
-     * Anvil instead of serving corrupted data.
+     * Reads one record. Store/transport errors are logged and reported as
+     * {@link ReadState#MISS} so callers fall back to Anvil instead of serving
+     * corrupted data. An empty payload is the deletion marker.
      */
-    public CompoundTag read(final int x, final int z, final int typeId) {
+    public ReadOutcome read(final int x, final int z, final int typeId) {
         final long handle = this.handle;
         if (handle == 0L) {
-            return null;
+            return ReadOutcome.miss();
         }
         final byte[] payload;
         try {
             payload = StrataNative.read(handle, x, z, typeId);
         } catch (final StrataException e) {
             LOGGER.error("[strata] read failed at ({}, {}) type {}: {}", x, z, typeId, e.getMessage());
-            return null;
+            return ReadOutcome.miss();
         }
         if (payload == null) {
-            return null;
+            return ReadOutcome.miss();
         }
         if (payload.length == 0) {
-            return new CompoundTag(); // deletion marker
+            return ReadOutcome.deleted();
         }
         try {
-            return NbtIo.readCompressed(new ByteArrayInputStream(payload), NbtAccounter.unlimitedHeap());
+            return ReadOutcome.hit(NbtIo.readCompressed(new ByteArrayInputStream(payload), NbtAccounter.unlimitedHeap()));
         } catch (final IOException e) {
             LOGGER.error("[strata] corrupt record at ({}, {}) type {}: {}", x, z, typeId, e.getMessage());
-            return null;
+            return ReadOutcome.miss();
         }
     }
 
@@ -227,7 +256,8 @@ public final class StrataWorld {
             return false;
         }
         try {
-            final byte[] payload = serialize(compound);
+            // null compound == deletion marker -> empty payload in the vstore
+            final byte[] payload = compound == null ? null : serialize(compound);
             final int rc = StrataNative.write(handle, x, z, typeId, payload);
             if (rc != 0) {
                 LOGGER.error("[strata] write failed at ({}, {}) type {}: {} (rc={})",
