@@ -9,8 +9,16 @@ fn second_open_fails_with_holder_info_until_drop() {
     let dir = tempfile::tempdir().unwrap();
     let s1 = Store::open(dir.path(), StoreConfig::default()).unwrap();
 
-    // 锁文件已写入持有者信息。
-    let info = std::fs::read_to_string(dir.path().join(".strata.lock")).unwrap();
+    // 锁文件已写入持有者信息（从偏移 1 读：字节 0 是被锁区间，
+    // Windows 持锁期间重叠读取会 ERROR_LOCK_VIOLATION）。
+    let info = {
+        use std::io::{Read, Seek};
+        let mut f = std::fs::File::open(dir.path().join(".strata.lock")).unwrap();
+        f.seek(std::io::SeekFrom::Start(1)).unwrap();
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        s
+    };
     assert!(info.contains("pid="), "lock file should carry holder info: {info}");
 
     let err = match Store::open(dir.path(), StoreConfig::default()) {

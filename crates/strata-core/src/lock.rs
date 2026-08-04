@@ -10,7 +10,7 @@
 //! `punch.rs` 同风格，不引入额外依赖。
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::StrataError;
@@ -36,8 +36,9 @@ impl SessionLock {
             .open(&path)?;
 
         if !try_lock_exclusive(&file) {
-            // 读取持有者信息（可能为空或不可读，均降级为无信息）。
-            let holder = std::fs::read_to_string(&path).unwrap_or_default();
+            // 读取持有者信息（从偏移 1 起——字节 0 是被锁区间，Windows 上
+            // 重叠读取会 ERROR_LOCK_VIOLATION；可能为空或不可读，降级无信息）。
+            let holder = read_holder_info(&path);
             let holder = holder.trim();
             let detail = if holder.is_empty() {
                 format!("`{}` is held by another session", path.display())
@@ -47,9 +48,11 @@ impl SessionLock {
             return Err(StrataError::Lock(detail));
         }
 
-        // 抢到锁后写入持有者信息（供下一个抢占者报错展示）。
+        // 抢到锁后写入持有者信息（从偏移 1 起，字节 0 留给锁区间，
+        // 供下一个抢占者在持锁期间也能读取）。
         let _ = file.set_len(0);
         let mut f = &file;
+        let _ = f.seek(SeekFrom::Start(1));
         let info = format!(
             "pid={} host={} opened_unix={}\n",
             std::process::id(),
@@ -80,6 +83,19 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// 读取锁文件中的持有者信息（偏移 1 起，跳过被锁的字节 0）。
+/// 任何失败（不存在/被占用/编码错）降级为空串。
+fn read_holder_info(path: &Path) -> String {
+    let read = || -> std::io::Result<String> {
+        let mut f = File::open(path)?;
+        f.seek(SeekFrom::Start(1))?;
+        let mut s = String::new();
+        f.read_to_string(&mut s)?;
+        Ok(s)
+    };
+    read().unwrap_or_default()
 }
 
 #[cfg(unix)]
