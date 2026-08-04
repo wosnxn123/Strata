@@ -38,12 +38,14 @@ exact tree verified to compile.
 
 ## What the patch does
 
-- **Config**: `<worldRoot>/strata.properties`, key `strata.enabled` (default
-  `false`, template auto-created on first start of the overworld). Additional
-  key `strata.compression.threads` (default 1 = serial; 0 = auto; N ≥ 2 =
-  bounded batch-write compression workers). Disabled =>
-  every code path is byte-identical to upstream (all hooks null-check the
-  per-level store handle, which is only opened when enabled).
+- **Config**: `<worldRoot>/strata.properties` (finalized 14+1 key set; template
+  auto-created on first start of the overworld). `strata.enabled` defaults to
+  `false`; `strata.compression.threads` (default 1 = serial; 0 = auto; N ≥ 2 =
+  bounded batch-write compression workers); `strata.force-anvil` (default
+  `false`) is the emergency escape hatch for the fail-closed guard below.
+  Disabled => every code path is byte-identical to upstream (all hooks
+  null-check the per-level store handle, which is only opened when enabled) —
+  unless a vstore already exists, in which case fail-closed applies.
 - **Scope**: multi-world — every level (overworld/nether/end and
   plugin-created worlds) resolves its own dimension directory and gets its
   own vstore at `<dimDir>/vstore`; the shared config (`strata.properties`)
@@ -51,20 +53,35 @@ exact tree verified to compile.
   (chunk=0, entity=1, poi=2), matching strata-cli's layout.
 - **Read routing** (`readData` in Chunk/Entity/Poi DataController): vstore
   first -> HIT returns `SYNC_READ` with the parsed CompoundTag; DELETED
-  (empty-payload marker) returns `NO_DATA`; MISS or any error falls through
-  to the original Anvil read.
+  (empty-payload marker) returns `NO_DATA`; MISS falls through to the original
+  Anvil read. Errors do **not** fall through: store failures and corrupt
+  records are thrown as `IOException` (wrapped `StrataException`) — the Anvil
+  copy of a vstore-managed chunk has been deleted, so silently "falling back"
+  would serve stale or no data.
 - **Write routing** (`startWrite`): writes CompoundTag -> compressed NBT bytes
-  into the vstore; on success returns `WriteData(compound, DELETE, null,
-  null)` which clears the now-stale Anvil record (no-op if the region file
-  doesn't exist); on any failure falls through to the original Anvil write —
-  data is never lost.
+  into the vstore via `strata_write` — **durable on return** (`write_durable`,
+  two fsyncs per record); on success returns `WriteData(compound, DELETE,
+  null, null)` which clears the now-stale Anvil record (no-op if the region
+  file doesn't exist) — that DELETE makes the vstore the only copy, hence the
+  per-record durability. On any failure falls through to the original Anvil
+  write — data is never lost.
 - **Lifecycle**: store opened in the ServerLevel constructor (every level:
   overworld/nether/end and plugin-created worlds), flushed on every
-  `saveAllChunks(flush=true)`, closed in `stopPart2()` before the level lock is released.
+  `saveAllChunks(flush=true)`, closed in `stopPart2()` before the level lock
+  is released. Online maintenance runs with the autosave cycle: every
+  `strata.tiering.stable-flushes` successful flushes trigger one GC + tiering
+  pass (`maybeRunMaintenance`); startup never scans.
 - **Native bridge**: vendored `dev.strata.bridge.StrataNative`; at runtime it
   extracts `/natives/strata_ffi.{so,dll,dylib}` from the classpath into a temp
-  dir and `System.load`s it. Missing/broken native => one warning, permanent
-  Anvil fallback, never a crash.
+  dir and `System.load`s it. Missing/broken native => one warning and Anvil
+  fallback only where no vstore exists; with an existing vstore the level
+  refuses to start (fail-closed) unless `strata.force-anvil=true`. Never a
+  JVM crash.
+- **Fail-closed startup**: a vstore with data (`vstore/manifest.vsm` present)
+  that Strata will not serve this run (disabled, native failure, open failure)
+  refuses to start the level — booting on Anvil would hide the vstore's
+  records. `strata.force-anvil=true` explicitly accepts that risk (vstore data
+  invisible until converted back; loud warning on every start).
 
 ## Native wiring (deployment)
 
@@ -87,7 +104,12 @@ paperweight's `additionalRuntimeClasspath`.
 - `/strata flush` — force-flush every open vstore
 - `/strata convert-to-strata` / `/strata convert-to-anvil` — synchronous
   conversion (refuses while Strata is active or players are online; saves all
-  Anvil data first; keeps the source side, prints verify-then-delete reminder)
+  Anvil data first; keeps the source side, prints verify-then-delete reminder).
+  Guarded: a dimension that already has a vstore is refused unless
+  `-f`/`--force` is given (the existing vstore may hold newer runtime data);
+  convert-to-anvil additionally warns that vstore-only records are not
+  enumerated by the Anvil manifest — use `strata-cli convert --to-anvil` for a
+  lossless full export
 
 Permission nodes follow the Canvas scheme `canvas.command.strata.<sub>`.
 
@@ -96,11 +118,18 @@ Permission nodes follow the Canvas scheme `canvas.command.strata.<sub>`.
 ```
 java -jar canvas-paperclip-26.2.local-SNAPSHOT.jar --strataConvertToStrata
 java -jar canvas-paperclip-26.2.local-SNAPSHOT.jar --strataConvertToAnvil
+java -jar canvas-paperclip-26.2.local-SNAPSHOT.jar --strataConvertToAnvil --strataForce
 ```
 
 Runs the conversion **before** world load, prints the keep-the-source
 reminder, then boots normally (Cesium-style). A failed conversion aborts
 startup to avoid a mixed-format world. Remove the flag afterwards.
+
+Both conversion flags refuse by default when the target dimension already has
+a vstore (which may hold newer runtime data); add `--strataForce` to confirm
+the overwrite/export. For `--strataConvertToAnvil` note that records written
+at runtime exist only in the vstore and are not enumerated by the Anvil key
+manifest — for a lossless full export use `strata-cli convert --to-anvil`.
 
 ## Build evidence (CNB, 2026-08-04/05)
 
@@ -128,14 +157,15 @@ byte-identical. Round 1: 1 compile error fixed (multi-catch subclassing,
 
 ## Known limitations / risks
 
-- `convert-to-anvil` uses the existing Anvil region files as the key manifest
-  (the FFI exposes no segment enumeration), so records that exist **only** in
-  the vstore are not materialized back to Anvil. Full export requires
-  strata-cli.
+- The in-server `convert-to-anvil` uses the existing Anvil region files as the
+  key manifest, so records written at runtime (which exist **only** in the
+  vstore) are not materialized back to Anvil. It is therefore **guarded**:
+  refuses without `-f`/`--force` (command) or `--strataForce` (startup flag).
+  For a lossless full export use `strata-cli convert --to-anvil`.
 - A chunk deleted while Strata is active writes an empty-payload marker to the
-  vstore and clears the Anvil copy; if Strata is later disabled without
-  converting back, that chunk appears gone to Anvil-only readers.
+  vstore and clears the Anvil copy. Disabling Strata afterwards no longer
+  silently boots on the stale Anvil side: fail-closed refuses to start the
+  level unless `strata.force-anvil=true`, and a full rollback requires
+  converting the vstore back to Anvil.
 - strata-cli walks all dimensions too (overworld root, `DIM-1`/`DIM1`,
   `dimensions/minecraft/*`), matching the server-side converter.
-- Mojang manifest downloads from CNB needed a hosts pin (`piston-meta.mojang.com`);
-  unrelated to the patch itself.

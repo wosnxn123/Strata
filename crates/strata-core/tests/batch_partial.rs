@@ -1,23 +1,13 @@
 //! write_batch 前缀提交语义回归（#19）：失败错误必须携带已提交条数。
+//!
+//! 故障注入方式：把下一个待分配段号的文件路径预置为**目录**——
+//! `create_new` 撞目录必失败（root/CAP_DAC_OVERRIDE 环境同样生效，
+//! 不依赖文件权限语义），孤儿探测的 `remove_file` 也删不掉目录。
 
 use strata_core::store::{BatchItem, Store, StoreConfig};
 use strata_core::StrataError;
 
-#[cfg(unix)]
-fn set_dir_readonly(path: &std::path::Path, ro: bool) {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = if ro { 0o555 } else { 0o755 };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-}
-
-#[cfg(windows)]
-fn set_dir_readonly(path: &std::path::Path, ro: bool) {
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_readonly(ro);
-    std::fs::set_permissions(path, perms).unwrap();
-}
-
-/// 段滚动把写入器关掉后，下一条记录需要新建段文件；此时段目录只读 →
+/// 段滚动把写入器关掉后，下一条记录需要新建段文件；此时目标段路径是目录 →
 /// alloc 失败。错误必须是 `BatchPartial` 且 `committed` 精确等于已落盘条数。
 #[test]
 fn batch_failure_carries_committed_prefix() {
@@ -28,14 +18,14 @@ fn batch_failure_carries_committed_prefix() {
         ..StoreConfig::default()
     };
     let mut s = Store::open(dir.path(), cfg).unwrap();
-    // 预热记录：offset 156 < 1000，写入器保持打开。
-    s.write(0, 0, 0, &vec![0u8; 100]).unwrap();
+    // 预热记录：offset 156 < 1000，写入器保持打开（seg-0001）。
+    s.write(0, 0, 0, &[0u8; 100]).unwrap();
 
-    let segments = dir.path().join("segments");
-    set_dir_readonly(&segments, true);
+    // 注入：下一个段号（seg-0002）的路径预置为目录 → alloc 必败。
+    std::fs::create_dir(dir.path().join("segments").join("seg-0002.vseg")).unwrap();
 
     // i1：offset 996，不滚动；i2：offset 1836 ≥ 1000，滚动关写入器；
-    // i3：写入器空 → 新建段 → 只读目录 → 失败。committed 必须 = 2。
+    // i3：写入器空 → 新建段 → 撞目录 → 失败。committed 必须 = 2。
     let items: Vec<BatchItem> = (0..3)
         .map(|i| BatchItem {
             x: 10 + i,
@@ -45,8 +35,6 @@ fn batch_failure_carries_committed_prefix() {
         })
         .collect();
     let err = s.write_batch(&items).unwrap_err();
-
-    set_dir_readonly(&segments, false); // 先恢复权限，保证后续断言/清理可执行
 
     match err {
         StrataError::BatchPartial { committed, source } => {
@@ -66,7 +54,7 @@ fn batch_failure_carries_committed_prefix() {
     assert!(s.read(12, 0, 0).unwrap().is_none());
 }
 
-/// 压缩阶段失败 → committed = 0 的同型错误（统一契约）。
+/// 首条记录即失败 → committed = 0 的同型错误（统一契约）。
 #[test]
 fn batch_failure_before_any_commit_reports_zero() {
     let dir = tempfile::tempdir().unwrap();
@@ -76,8 +64,9 @@ fn batch_failure_before_any_commit_reports_zero() {
     };
     let mut s = Store::open(dir.path(), cfg).unwrap();
 
-    let segments = dir.path().join("segments");
-    set_dir_readonly(&segments, true);
+    // 注入：首个段号（seg-0001）的路径预置为目录 → 首次 alloc 即败。
+    std::fs::create_dir(dir.path().join("segments").join("seg-0001.vseg")).unwrap();
+
     let items = vec![BatchItem {
         x: 1,
         z: 1,
@@ -85,7 +74,6 @@ fn batch_failure_before_any_commit_reports_zero() {
         nbt: b"first".to_vec(),
     }];
     let err = s.write_batch(&items).unwrap_err();
-    set_dir_readonly(&segments, false);
 
     match err {
         StrataError::BatchPartial { committed, .. } => assert_eq!(committed, 0),

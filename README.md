@@ -23,8 +23,8 @@
 - **其它 Paper/Folia 系服务端 / other Paper/Folia forks**：按 [docs/SERVER_SUPPORT.md](docs/SERVER_SUPPORT.md) 与 [BUILD_GUIDE.md](docs/BUILD_GUIDE.md) 将源码补丁嵌入你的 fork 后自行构建。
   Embed the source patches into your own fork following [docs/SERVER_SUPPORT.md](docs/SERVER_SUPPORT.md) and [BUILD_GUIDE.md](docs/BUILD_GUIDE.md).
 
-构建产物 paperclip 中已内嵌对应平台的 native 库（`strata_ffi.dll` / `libstrata_ffi.so`）。若 native 缺失或加载失败，服务器**自动回退 Anvil**，不会崩溃。
-The paperclip artifact embeds the platform native library (`strata_ffi.dll` / `libstrata_ffi.so`). If the native is missing or fails to load, the server **falls back to Anvil automatically** — it never crashes.
+构建产物 paperclip 中已内嵌对应平台的 native 库（`strata_ffi.dll` / `libstrata_ffi.so`）。native 缺失或加载失败：该维度**尚无 vstore** 时**自动回退 Anvil**；**已有 vstore** 时 **fail-closed 拒绝启动该 level**（否则 vstore 数据不可见），可用 `strata.force-anvil=true` 应急逃生（vstore 数据转回前不可见，每次启动醒目 WARN）。
+The paperclip artifact embeds the platform native library (`strata_ffi.dll` / `libstrata_ffi.so`). If the native is missing or fails to load: dimensions **without** a vstore **fall back to Anvil automatically**; a dimension **with** an existing vstore **refuses to start (fail-closed)** — otherwise vstore data would be invisible. `strata.force-anvil=true` overrides this as an emergency escape (vstore data stays invisible until converted back; warned loudly on every boot).
 
 ### 2. 启用 Strata / Enable Strata
 
@@ -71,6 +71,9 @@ Or convert via server launch flags (runs synchronously before boot):
 --strataConvertToAnvil     # Strata → Anvil
 ```
 
+服务端转换入口（上述两个启动参数与 `/strata convert-to-*` 子命令）在目标维度已有 vstore 时**默认拒绝**，需显式加 `--strataForce`（子命令为 `-f/--force`）确认；见下文"关闭与回滚"。
+The server-side conversion entries (the two launch flags and the `/strata convert-to-*` subcommands) **refuse by default** when the target dimension already has a vstore — add `--strataForce` (`-f/--force` for the subcommand) to confirm.
+
 转换**绝不删除源文件**（`region/` 等），验证无误后手动删除。
 Conversion **never deletes the source** (`region/` etc.); remove it manually after verification.
 
@@ -86,12 +89,26 @@ strata-cli compact <world>      # 手动 GC 压实 / manual GC compaction
 strata-cli recompress <world>   # 按当前配置全量重压 / full recompress with current config
 ```
 
+> ⚠️ **停服执行 / stop the server first**：vstore 有独占会话锁（`vstore/.strata.lock`），对运行中服务的 vstore 跑 CLI 会报"另一个进程正在使用"。在线 GC/tier 已随 autosave 周期自动运行（每 `stable-flushes` 次成功 flush 触发一轮），CLI 只用于离线深度维护。
+> The vstore holds an exclusive session lock (`vstore/.strata.lock`); the CLI against a live server's vstore reports "another process is using it". Online GC/tier already runs with the autosave cycle (one pass per `stable-flushes` successful flushes) — the CLI is for offline deep maintenance only.
+>
+> ⚠️ **备份注意 / backup note**：挖洞产生稀疏文件，不感知稀疏的复制工具会膨胀回逻辑大小——用 `tar --sparse` 或支持稀疏的工具，或直接复制段文件；建议防病毒软件排除 vstore 目录。
+> Hole-punching creates sparse files; copy tools that ignore sparseness re-inflate them to logical size — use `tar --sparse` or a sparse-aware tool, or copy the segment files directly. Consider excluding the vstore directory from antivirus scans.
+>
+> ⚠️ **NFS/网络文件系统/多机共享卷不支持 / no NFS/shared volumes**：锁与 rename/fsync/挖洞语义依赖本地文件系统。
+> Locks and rename/fsync/hole-punch semantics require a local filesystem.
+
 ### 6. 关闭与回滚 / Disable and rollback
 
-1. `strata.enabled=false`（或删除配置）→ 服务器回到 Anvil 路径（vstore 保留）。
-   Set `strata.enabled=false` (or remove the file) → the server returns to the Anvil path (vstore retained).
-2. 需要彻底回到 Anvil 文件：`strata-cli convert --to-anvil <world>`。
-   To fully return to Anvil files: `strata-cli convert --to-anvil <world>`.
+> ⚠️ **风险提示 / caveat**：Strata 运行期写过的 chunk，其 Anvil 主副本在写成功时即被删除（vstore 是唯一副本）。
+> Chunks written while Strata was running have had their Anvil master copies deleted on successful write — the vstore holds the only copy.
+
+1. `strata.enabled=false`（或删除配置）→ 若 vstore 存在，**fail-closed 拒绝启动该 level**（防止 vstore 数据被静默无视）；`strata.force-anvil=true` 才放行（应急逃生：vstore 数据转回前不可见，每次启动醒目 WARN）。
+   With `strata.enabled=false` and a vstore present, **fail-closed refuses to start the level** (so vstore data is never silently invisible); `strata.force-anvil=true` overrides this (emergency escape: vstore data stays invisible until converted back; warned loudly on every boot).
+2. 彻底回到 Anvil 文件（**推荐**）：停服后 `strata-cli convert --to-anvil <world>` —— 无损全量导出。服务端入口 `--strataConvertToAnvil` / `/strata convert-to-anvil` 需 `--strataForce`/`-f` 显式确认，且只存在于 vstore 的记录（运行期写入）不会被 Anvil 清单枚举、可能漏出。
+   To fully return to Anvil files (**recommended**): stop the server and run `strata-cli convert --to-anvil <world>` — a lossless full export. The server-side entries (`--strataConvertToAnvil` / `/strata convert-to-anvil`) require explicit `--strataForce`/`-f` and can miss records that exist only in the vstore (written at runtime).
+3. 回滚完成、验证无误后再删除 `vstore/`。
+   Delete `vstore/` only after the rollback is verified.
 
 ---
 
@@ -101,14 +118,14 @@ strata-cli recompress <world>   # 按当前配置全量重压 / full recompress 
   Hot segment log + cold blocked archive; **45%+** smaller than Anvil overall (measured 0.097× on highly compressible workloads).
 - 🧠 **内存有界 / bounded memory**：存储层内存占用**与世界大小无关**——常驻仅几十 MB，索引缓存上界可配；10 TB 级存档（2b2t 量级）同样适用。
   Storage memory is **independent of world size** — tens of MB resident, configurable index cache cap; suitable for 10 TB-class worlds.
-- 🔧 **崩溃自愈 / crash-safe**：epoch 回放恢复 + manifest 影子双副本；单条记录 xxhash64 逐条校验，损坏只隔离该条、不传播。
-  Epoch-log recovery + shadow dual-copy manifest; per-record xxhash64 verification isolates corruption to the single record.
+- 🔧 **崩溃自愈 / crash-safe**：epoch 回放恢复 + manifest 影子双副本；单条记录 xxhash64 逐条校验，损坏只隔离该条、不传播。服务端写路径**返回即持久**（每记录 2 次 fsync——写成功后即删 Anvil 主副本，必须逐条持久）；批量/转换路径组提交（批尾一次 sync）。
+  Epoch-log recovery + shadow dual-copy manifest; per-record xxhash64 verification isolates corruption to the single record. The server write path is **durable on return** (two fsyncs per record — the Anvil master copy is deleted on success); batch/conversion paths use group commit (one sync per batch).
 - 🔁 **Cesium 式双向转换 / bidirectional conversion**：CLI 或启动参数在 Strata 与 Anvil 之间原地互转，断点续传，多维度全覆盖。
   In-place Strata ⇄ Anvil conversion via CLI or launch flags, resumable, covering all dimensions.
 - 🎛️ **配置即改即生效（混存）/ live config mixing**：每条记录自带 codec/字典槽/代际，任意时刻修改压缩配置，新旧记录自由共存。
   Every record carries its own codec/dictionary/generation; compression config can change anytime, old and new records coexist.
-- 🧵 **Folia 无锁并发 / Folia-friendly concurrency**：分区写入 + SIEVE 近免锁缓存，原生适配 regionizer 多线程模型；批量压缩线程数可配（默认串行，TPS 优先）。
-  Partitioned writes + near-lock-free SIEVE cache; batch-compression thread count is configurable (default serial, TPS-first).
+- 🧵 **Folia 友好并发 / Folia-friendly concurrency**：写入经单活跃段 + 全局写锁串行（shard-per-region 未实现），读取走近免锁 SIEVE 缓存，适配 regionizer 多线程模型；批量压缩线程数可配（默认串行，TPS 优先）。
+  Writes serialize on a single active segment behind a global write lock; reads go through the near-lock-free SIEVE cache; batch-compression thread count is configurable (default serial, TPS-first).
 
 ---
 
@@ -164,7 +181,6 @@ strata.compression.hot-enabled=true
 strata.compression.cold-enabled=true
 strata.compression.hot=zstd-3
 strata.compression.cold=zstd-9
-strata.compression.dictionary=true
 # Batch compression workers: 0=auto(all cores) 1=serial(default, TPS-first) N>=2=capped
 # 批量压缩线程：0=自动(全核) 1=串行(默认,TPS优先) N≥2=限N线程
 strata.compression.threads=1
@@ -174,6 +190,11 @@ strata.index.cache-mb=512
 strata.gc.enabled=true
 strata.gc.invalid-threshold=0.6
 strata.gc.budget-bytes=33554432
+# Minimum hole bytes for punch / 挖洞最小洞阈值（字节）
+strata.gc.min-hole-bytes=65536
+# Emergency escape: boot on Anvil even when a vstore exists (data in vstore invisible until converted back)
+# 应急逃生门：vstore 存在时仍按 Anvil 启动（vstore 内数据在转回前不可见）
+strata.force-anvil=false
 ```
 
 ---

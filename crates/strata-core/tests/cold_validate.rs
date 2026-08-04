@@ -27,8 +27,8 @@ fn cold_get_rejects_slot_envelope_mismatch() {
     let path = dir.path().join("r.0.0.varc");
 
     let mut b = ArchiveBuilder::new(0, 0, 9, None);
-    b.add(env(0, 0, &vec![7u8; 100]), vec![7u8; 100]);
-    b.add(env(1, 0, &vec![8u8; 100]), vec![8u8; 100]);
+    b.add(env(0, 0, &[7u8; 100]), vec![7u8; 100]);
+    b.add(env(1, 0, &[8u8; 100]), vec![8u8; 100]);
     b.finish(&path).unwrap();
 
     // 头部布局：magic(4) | region_x(4) | region_z(4) | block_count u32 | slot_count u32；
@@ -61,7 +61,7 @@ fn cold_get_serves_intact_archive() {
     let path = dir.path().join("r.0.0.varc");
     let mut b = ArchiveBuilder::new(0, 0, 9, None);
     for x in 0..4i32 {
-        b.add(env(x, 0, &vec![x as u8; 50]), vec![x as u8; 50]);
+        b.add(env(x, 0, &[x as u8; 50]), vec![x as u8; 50]);
     }
     b.finish(&path).unwrap();
     let mut r = ArchiveReader::open(&path).unwrap();

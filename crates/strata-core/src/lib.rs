@@ -8,6 +8,7 @@ pub mod gc;
 pub mod index;
 pub mod lock;
 pub mod manifest;
+pub mod punch;
 pub mod segment;
 pub mod store;
 pub mod sync_store;

@@ -37,7 +37,7 @@ fn env_for(x: i32, z: i32, nbt: &[u8]) -> Envelope {
 fn fill_region(s: &mut Store) {
     for x in 0..4i32 {
         for z in 0..2i32 {
-            s.write(x, z, 0, &vec![(x * 2 + z) as u8; 64]).unwrap();
+            s.write(x, z, 0, &[(x * 2 + z) as u8; 64]).unwrap();
         }
     }
     s.flush().unwrap();
@@ -163,7 +163,7 @@ fn promote_invalidate_demote_roundtrip_with_reopen() {
         assert_eq!(s.tier_pass(&fast_tier()).unwrap().promoted, 1);
         // 改写半数键 → 冷槽失效（热层新值）。
         for x in 0..4i32 {
-            s.write(x, 0, 0, &vec![0xEE; 32]).unwrap();
+            s.write(x, 0, 0, &[0xEE; 32]).unwrap();
         }
         s.flush().unwrap();
     }

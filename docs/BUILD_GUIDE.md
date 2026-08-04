@@ -104,8 +104,8 @@ gradle jar
    - 或直接把 jar 放进服务器运行目录的 `libraries/` 目录（Paper 启动器会扫描 `libraries/` 下按 maven 布局组织的 jar）。
 2. 在 fork 的源码 patch 中直接调用 `dev.strata.bridge.StrataNative`（参考 `canvas-patch/` 下的成品集成）：
    - 每个 ServerLevel 构造期解析**自己的**世界根与维度目录（`LevelStorageAccess.getLevelPath(ROOT)` / `getDimensionPath(dimension)`），对维度目录调一次 `StrataNative.open(dimDir + "/vstore", ..., compressionThreads)` 拿 handle——主世界/下界/末地/插件创建的世界各自独立 store；
-   - 在 Moonrise chunk IO 的字节边界 hook 点（`ChunkDataController`/`EntityDataController`/`PoiDataController` 的 `startWrite`/`readData`）把 NBT blob 交给 `StrataNative.write(handle, x, z, typeId, nbt)`；写成功返回 DELETE 结果清除旧 Anvil 副本，读取 `null`（无记录）回退 Anvil 读；
-   - 定期/关服时对全部打开的 store `flush` / `gc` / `tier` / `close`；
+   - 在 Moonrise chunk IO 的字节边界 hook 点（`ChunkDataController`/`EntityDataController`/`PoiDataController` 的 `startWrite`/`readData`）把 NBT blob 交给 `StrataNative.write(handle, x, z, typeId, nbt)`；**写成功即持久**（JNI 走 `write_durable`，每记录 2 次 fsync），随后返回 DELETE 结果清除旧 Anvil 副本（vstore 成为唯一副本）；读 `null`（无记录）回退 Anvil 读，**读错误抛异常、不静默回退**（见 5.2）；
+   - 每次 autosave（`saveAllChunks`）对全部打开的 store `flush`，每 `strata.tiering.stable-flushes` 次成功 flush 触发一轮在线维护（GC+tier）；关服路径 `close`；
    - `open` 第 9 参 `compressionThreads`：批量压缩线程数（0=自动全核 / 1=串行默认，TPS 优先 / N≥2 限流），读世界根 `strata.properties` 的 `strata.compression.threads`。
 3. Canvas 的集成 patch 由 Strata 项目维护（见 `docs/SERVER_SUPPORT.md`），随 fork 既有补丁同一 rebase 流程维护。
 
@@ -122,7 +122,7 @@ classpath 接入方式与 5.1 相同（`additionalRuntimeClasspath` 或 `librari
 | `MinecraftServer` | `saveAllChunks` 后 flush 全部 store；关服路径 `closeAll` |
 | `net.minecraft.server.Main` / `org.bukkit.craftbukkit.Main` | 启动转换参数（`--strataConvertToStrata` / `--strataConvertToAnvil`） |
 
-接入语义（已在 Canvas 验证）：写路径在 `startWrite` 拦截序列化后的 NBT 字节交给 `StrataNative.write`，成功则返回 `WriteResult.DELETE`（清除旧 Anvil 副本，region 文件不存在时无操作）；读路径在 `readData` 先查 vstore——命中返回 `SYNC_READ`、已删除返回 `NO_DATA`、未命中**落回 Anvil 原路径**（混存迁移期关键）。shim 挂在 Moonrise chunk IO 线程之下（regionizer 下游），不触碰 tick 线程模型——详见设计文档 §11（`docs/superpowers/specs/2026-08-04-strata-storage-design.md`）。完整可参考实现：本仓 `canvas-patch/` 目录（weaver patch + Java 源码，随 Canvas fork 实服验证过）。
+接入语义（已在 Canvas 验证）：写路径在 `startWrite` 拦截序列化后的 NBT 字节交给 `StrataNative.write`——**写成功即持久**（JNI 走 `write_durable`，每记录 2 次 fsync），成功则返回 `WriteResult.DELETE`（清除旧 Anvil 副本，region 文件不存在时无操作）；该 DELETE 使 vstore 成为记录的唯一副本，故必须逐条持久。读路径在 `readData` 先查 vstore——命中返回 `SYNC_READ`、已删除返回 `NO_DATA`、未命中**落回 Anvil 原路径**（混存迁移期关键）；**读错误（native 失败/记录损坏）抛 `StrataException`→`IOException`，不静默回退 Anvil**——vstore 管理记录的 Anvil 主副本已删，静默回退会读到旧数据或空。shim 挂在 Moonrise chunk IO 线程之下（regionizer 下游），不触碰 tick 线程模型——详见设计文档 §11（`docs/superpowers/specs/2026-08-04-strata-storage-design.md`）。完整可参考实现：本仓 `canvas-patch/` 目录（weaver patch + Java 源码，随 Canvas fork 实服验证过）。
 
 ### 5.3 模组端（Fabric / NeoForge）
 
@@ -131,6 +131,11 @@ classpath 接入方式与 5.1 相同（`additionalRuntimeClasspath` 或 `librari
 - **Fabric**：mod jar 内嵌（`fabric.mod.json` 的 `jars` 字段声明内嵌 jar），或放入 `mods/` 目录 alongside；初始化入口（`ModInitializer.onInitialize`）调用 `StrataNative.load()`。
 - **NeoForge/Forge**：`mods.toml`/`neoforge.mods.toml` 声明 jar-in-jar 依赖，`FMLJavaModLoadingContext` 初始化钩子里 `load()`。
 - 注意：模组端复用 vanilla IO 适配层（对标 Cesium 形态），存储替换 hook 仍需模组自行实现；桥 jar 只负责 native 加载与调用转发。
+
+### 5.4 运维边界（会话锁与配置键）
+
+- **CLI 维护需停服**：vstore 有独占会话锁（`<dimDir>/vstore/.strata.lock`，flock/LockFileEx，锁文件记录持有者信息），`Store::open` 与 CLI 都抢锁；对运行中服务的 vstore 跑 CLI 会报"另一个进程正在使用"。在线 GC/tier 随 autosave 周期自动运行（每 `stable-flushes` 次成功 flush 一轮），CLI 的 `compact`/`recompress`/`convert` 是离线深度维护。NFS/网络文件系统/多机共享卷不支持（锁与 rename/fsync/挖洞语义依赖本地文件系统）。
+- **配置键（定稿 14+1 键）**：模板见设计文档 §9。`strata.compression.dictionary` **已停用**（旧键仍识别，WARN 后忽略）；新增 `strata.gc.min-hole-bytes`（挖洞最小洞阈值，默认 65536）与 `strata.force-anvil`（应急逃生门：vstore 存在但 Strata 未接管——`enabled=false`、native 失败、open 失败——时默认 **fail-closed 拒绝启动该 level**，置 `true` 才按 Anvil 启动且数据不可见、每次启动醒目 WARN）。
 
 ---
 

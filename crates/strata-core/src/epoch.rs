@@ -75,14 +75,13 @@ impl EpochLog {
         })
     }
 
-    /// Append one fixed-size ([`ENTRY_SIZE`]) entry, flush it to the OS and
-    /// sync the log file before returning.
+    /// Append one fixed-size ([`ENTRY_SIZE`]) entry and flush it to the OS.
+    /// `sync`: additionally fsync the log before returning.
     ///
-    /// Per-write durability: callers rely on "segment data synced → entry
-    /// synced" (WAL ordering), so once this returns the entry is durable.
-    /// The per-record `sync_all` is deliberate and costs one metadata+data
-    /// sync per write.
-    pub fn record(&mut self, e: &EpochEntry) -> Result<(), StrataError> {
+    /// 组提交支持：批量路径以 `sync=false` 逐条记账（write+flush 到 OS），
+    /// 批尾统一 [`EpochLog::sync`]；持久化路径以 `sync=true` 逐条落盘。
+    /// WAL 顺序由调用方保证（段数据先于日志同步）。
+    pub fn record(&mut self, e: &EpochEntry, sync: bool) -> Result<(), StrataError> {
         let mut buf = [0u8; ENTRY_SIZE]; // zero padding pre-filled
         buf[OFF_SEG_ID..OFF_SEG_ID + 4].copy_from_slice(&e.seg_id.to_le_bytes());
         let mut env_buf = [0u8; ENVELOPE_SIZE];
@@ -91,6 +90,14 @@ impl EpochLog {
         buf[OFF_OFFSET..OFF_OFFSET + 8].copy_from_slice(&e.offset.to_le_bytes());
         self.w.write_all(&buf)?;
         self.w.flush()?;
+        if sync {
+            self.w.get_ref().sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// fsync 日志文件（组提交的批尾同步）。
+    pub fn sync(&mut self) -> Result<(), StrataError> {
         self.w.get_ref().sync_all()?;
         Ok(())
     }
@@ -160,17 +167,23 @@ mod tests {
     fn record_rotate_replay_cycle() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = EpochLog::open(dir.path()).unwrap();
-        log.record(&EpochEntry {
-            seg_id: 2,
-            env: sample_env(),
-            offset: 100,
-        })
+        log.record(
+            &EpochEntry {
+                seg_id: 2,
+                env: sample_env(),
+                offset: 100,
+            },
+            true,
+        )
         .unwrap();
-        log.record(&EpochEntry {
-            seg_id: 2,
-            env: sample_env(),
-            offset: 200,
-        })
+        log.record(
+            &EpochEntry {
+                seg_id: 2,
+                env: sample_env(),
+                offset: 200,
+            },
+            true,
+        )
         .unwrap();
         assert_eq!(log.replay().unwrap().len(), 2);
         log.rotate().unwrap();
@@ -181,11 +194,14 @@ mod tests {
     fn torn_tail_entry_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = EpochLog::open(dir.path()).unwrap();
-        log.record(&EpochEntry {
-            seg_id: 1,
-            env: sample_env(),
-            offset: 16,
-        })
+        log.record(
+            &EpochEntry {
+                seg_id: 1,
+                env: sample_env(),
+                offset: 16,
+            },
+            true,
+        )
         .unwrap();
         drop(log);
         // 模拟崩溃：追加 10 字节垃圾（不足一条 64B）

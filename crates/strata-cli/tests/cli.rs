@@ -115,7 +115,7 @@ fn interrupted_conversion_resumes_and_preserves_skipped_regions() {
     // 模拟 chunk region 已写入后中断的盘上状态：负载故意与源不同。
     {
         let mut store =
-            Store::open(dir.path().join("vstore"), StoreConfig::default()).unwrap();
+            Store::open(&dir.path().join("vstore"), StoreConfig::default()).unwrap();
         for i in 0..10i32 {
             store.write(i, 0, 0, &gzip(&[0x5Au8; 200])).unwrap();
         }
@@ -230,7 +230,7 @@ fn sector_overflow_rejected_on_to_anvil() {
     // 直接写入 vstore（Anvil 源本身装不下 >255 扇区的记录，vanilla 同样失败）。
     {
         let mut store =
-            Store::open(dir.path().join("vstore"), StoreConfig::default()).unwrap();
+            Store::open(&dir.path().join("vstore"), StoreConfig::default()).unwrap();
         store.write(0, 0, 0, &nbt).unwrap();
         store.flush().unwrap();
     }
@@ -321,7 +321,7 @@ fn compact_skips_gc_when_disabled() {
     // 同一键覆写 50 次：49 条死记录（死占比 ≈ 0.98 ≥ 阈值 0.6，GC 若运行必回收）。
     {
         let mut store =
-            Store::open(dir.path().join("vstore"), StoreConfig::default()).unwrap();
+            Store::open(&dir.path().join("vstore"), StoreConfig::default()).unwrap();
         for i in 0..50u8 {
             store.write(0, 0, 0, &[i; 1024]).unwrap();
         }
@@ -346,7 +346,7 @@ fn to_anvil_handles_legacy_raw_payloads() {
     let dir = tempfile::tempdir().unwrap();
     {
         let mut store =
-            Store::open(dir.path().join("vstore"), StoreConfig::default()).unwrap();
+            Store::open(&dir.path().join("vstore"), StoreConfig::default()).unwrap();
         store.write(1, 2, 0, b"legacy-raw-nbt").unwrap();
         store.flush().unwrap();
     }

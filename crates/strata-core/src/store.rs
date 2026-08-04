@@ -359,10 +359,26 @@ impl Store {
 
     /// 写入一条记录（压缩 → 追加段 → epoch 日志 → 内存索引）。
     ///
-    /// 持久化语义：返回 `Ok` 时记录已持久（段数据与 epoch 日志均 sync）。
+    /// 持久化语义：vanilla 等价——记录立即可见（同会话可读），落盘强度为
+    /// "OS 缓存 + 日志 flush"；崩溃最多丢自上次 [`Store::flush`] 以来的记录
+    /// （回放按段文件实际长度兜底）。需要"返回即持久"的调用方（如服务端
+    /// 在写成功后删除主副本）用 [`Store::write_durable`]。
     pub fn write(&mut self, x: i32, z: i32, type_id: u16, nbt: &[u8]) -> Result<(), StrataError> {
         let (compressed, comp_id) = self.compress_payload(type_id, nbt)?;
-        self.append_compressed(x, z, type_id, compressed, comp_id)
+        self.append_compressed(x, z, type_id, compressed, comp_id, false)
+    }
+
+    /// 写入一条记录并**确保持久**：返回 `Ok` 时段数据与 epoch 日志均已 sync。
+    /// 代价是每条两次 fsync——仅用于"成功后即删除唯一主副本"的调用路径。
+    pub fn write_durable(
+        &mut self,
+        x: i32,
+        z: i32,
+        type_id: u16,
+        nbt: &[u8],
+    ) -> Result<(), StrataError> {
+        let (compressed, comp_id) = self.compress_payload(type_id, nbt)?;
+        self.append_compressed(x, z, type_id, compressed, comp_id, true)
     }
 
     /// 热层压缩：开关 + 字典槽解析，与 [`Store::read`] 的解压规则严格对称。
@@ -396,13 +412,12 @@ impl Store {
     }
 
     /// 已压缩记录的落盘子路径：gen 分配 → 段追加（WAL：数据先持久化）→
-    /// epoch 日志（flush+sync）→ 内存索引 → 段表记账 → 段滚动 → 冷区失效。
+    /// epoch 日志 → 内存索引 → 段表记账 → 段滚动 → 冷区失效。
     ///
-    /// [`Store::write`] 与 [`Store::write_batch`] 共用此路径，保证单条与批量
-    /// 写入语义完全一致（同一条 gen/段/epoch/索引链路）。
-    ///
-    /// 代价说明：每条记录一次段文件 `sync_data` + 一次日志 `sync_all`，
-    /// 这是"返回即持久"的价格。
+    /// [`Store::write`]/[`Store::write_durable`]/[`Store::write_batch`] 共用
+    /// 此路径（同一条 gen/段/epoch/索引链路）。`durable=true`：段 `sync_data`
+    /// 与日志 `sync_all` 逐条落盘（返回即持久）；`durable=false`：数据经
+    /// `flush_buf` 到 OS、日志 flush 到 OS（组提交路径在批尾统一 sync）。
     fn append_compressed(
         &mut self,
         x: i32,
@@ -410,6 +425,7 @@ impl Store {
         type_id: u16,
         compressed: Vec<u8>,
         comp_id: u8,
+        durable: bool,
     ) -> Result<(), StrataError> {
         // 1. gen 分配。
         let gen = self.manifest.next_gen;
@@ -447,17 +463,25 @@ impl Store {
                 return Err(e);
             }
         };
-        if let Err(e) = writer.sync_data() {
+        if durable {
+            if let Err(e) = writer.sync_data() {
+                self.writer = None;
+                return Err(e);
+            }
+        } else if let Err(e) = writer.flush_buf() {
             self.writer = None;
             return Err(e);
         }
 
-        // 5. epoch 日志（record 内部 flush+sync；数据已在盘上，回放不悬空）。
-        self.epoch.record(&EpochEntry {
-            seg_id,
-            env: env.clone(),
-            offset,
-        })?;
+        // 5. epoch 日志（durable 时逐条 sync；组提交批尾统一 sync）。
+        self.epoch.record(
+            &EpochEntry {
+                seg_id,
+                env: env.clone(),
+                offset,
+            },
+            durable,
+        )?;
 
         // 6. 内存索引。
         let st = self.segs.get_mut(&seg_id).expect("segment state exists");
@@ -497,18 +521,19 @@ impl Store {
         Ok(())
     }
 
-    /// 批量写入：压缩（串行或有界并行）+ 串行追加落盘。
+    /// 批量写入：压缩（串行或有界并行）+ 串行追加 + **组提交**。
     ///
     /// 压缩是纯函数（只读 `cfg` 与 `manifest` 字典槽），并发度由
     /// [`StoreConfig::compression_threads`] 控制：`1`（默认）或单条走串行；
     /// `0`（全部可用核心）/`N ≥ 2` 在 [`std::thread::scope`] 内派生有界
     /// worker 线程分块压缩——不用 rayon 全局池，避免与游戏线程抢核且可按
-    /// Store 配置限流。随后串行循环走 [`Store::append_compressed`]，每条记录
-    /// 与 [`Store::write`] 共享同一条 gen/段/epoch/索引链路。
+    /// Store 配置限流。随后串行循环走 [`Store::append_compressed`]（非持久
+    /// 变体），批尾**一次**段 `sync_data` + 一次日志 `sync_all`（group
+    /// commit）：返回 `Ok` 时整批持久，且 fsync 成本摊薄为 O(1)/批。
     ///
-    /// **前缀提交语义**：记录逐条持久化，任一失败不回滚已提交部分，错误为
-    /// [`StrataError::BatchPartial`]（`committed` = 已提交条数）。调用方重试
-    /// 时应跳过前 `committed` 条。空批量不做任何 IO，返回 `written = 0`。
+    /// **前缀提交语义**：任一失败不回滚已提交部分，错误为
+    /// [`StrataError::BatchPartial`]（`committed` = 已追加条数）。空批量不做
+    /// 任何 IO，返回 `written = 0`。
     pub fn write_batch(&mut self, items: &[BatchItem]) -> Result<BatchWriteResult, StrataError> {
         if items.is_empty() {
             return Ok(BatchWriteResult { written: 0 });
@@ -521,13 +546,34 @@ impl Store {
 
         let mut committed = 0u64;
         for (item, (bytes, comp_id)) in items.iter().zip(compressed) {
-            if let Err(e) = self.append_compressed(item.x, item.z, item.type_id, bytes, comp_id) {
+            if let Err(e) =
+                self.append_compressed(item.x, item.z, item.type_id, bytes, comp_id, false)
+            {
                 return Err(StrataError::BatchPartial {
                     committed,
                     source: Box::new(e),
                 });
             }
             committed += 1;
+        }
+
+        // 组提交批尾：段数据与日志一次性持久化（WAL 顺序：数据先于日志）。
+        if committed > 0 {
+            if let Some(w) = self.writer.as_mut() {
+                if let Err(e) = w.sync_data() {
+                    self.writer = None;
+                    return Err(StrataError::BatchPartial {
+                        committed,
+                        source: Box::new(e),
+                    });
+                }
+            }
+            if let Err(e) = self.epoch.sync() {
+                return Err(StrataError::BatchPartial {
+                    committed,
+                    source: Box::new(e),
+                });
+            }
         }
 
         Ok(BatchWriteResult {
@@ -811,6 +857,15 @@ impl Store {
             remove_file_with_retry(&path).map_err(|e| {
                 StrataError::Manifest(format!("删除孤儿段文件 `{}` 失败: {e}", path.display()))
             })?;
+            // 孤儿段的索引页（若存在）必然陈旧——它指向的偏移属于已被删除的
+            // 旧段内容；留下会被 flush 合并进新页，造成同键同 gen 的幽灵条目
+            // 与真实记录非确定性竞争（审计 flaky：keep-a 读回 None）。随段同删。
+            let ix = ix_path(&self.root, id);
+            if ix.exists() {
+                remove_file_with_retry(&ix).map_err(|e| {
+                    StrataError::Manifest(format!("删除孤儿段索引 `{}` 失败: {e}", ix.display()))
+                })?;
+            }
         }
         let mut w = SegmentWriter::create(&path, id)?;
         // 文件头先持久化，再登记：盘上 manifest 永远认识已创建的段。
@@ -998,6 +1053,7 @@ impl Store {
     /// - 未登记且不可解析的半截 `.varc` → 删除（写归档中途崩溃的残留，
     ///   此时热层尚未 purge，数据在热层完整）；
     /// - 已登记但文件缺失 → 除名。
+    ///
     /// 返回 manifest 是否被修改。
     fn reconcile_cold(&mut self) -> Result<bool, StrataError> {
         let mut dirty = false;

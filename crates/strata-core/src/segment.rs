@@ -5,7 +5,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::envelope::{Envelope, ENVELOPE_SIZE};
 use crate::StrataError;
@@ -23,6 +23,7 @@ pub const SEG_MAGIC: [u8; 4] = *b"VS01";
 pub struct SegmentWriter {
     w: Option<BufWriter<File>>,
     offset: u64,
+    path: PathBuf,
 }
 
 impl SegmentWriter {
@@ -43,6 +44,7 @@ impl SegmentWriter {
         Ok(Self {
             w: Some(w),
             offset: SEG_HEADER_SIZE,
+            path: path.to_path_buf(),
         })
     }
 
@@ -132,8 +134,12 @@ impl SegmentWriter {
     /// 重建缓冲并定位到 offset；截断/定位失败则写入器作废（`w = None`），
     /// 后续 append 报错而不是写坏文件。
     fn recover_partial_write(&mut self) {
-        let Some(bw) = self.w.take() else { return };
-        let mut file = bw.into_inner().unwrap_or_else(|e| e.into_inner());
+        // 丢弃不可信缓冲与句柄（Drop 内部 flush 失败被忽略，正合需求）。
+        self.w = None;
+        // 重开同一文件取回干净的 File（绕开 BufWriter::into_inner 的强制 flush）。
+        let Ok(mut file) = OpenOptions::new().write(true).open(&self.path) else {
+            return; // 写入器作废（w 保持 None）
+        };
         let ok = file
             .set_len(self.offset)
             .and_then(|()| file.seek(SeekFrom::Start(self.offset)))

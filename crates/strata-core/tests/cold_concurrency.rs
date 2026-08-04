@@ -17,7 +17,7 @@ fn concurrent_cold_reads_are_consistent() {
     for x in 0..32i32 {
         for z in 0..2i32 {
             let v = (x * 2 + z) as u8;
-            store.write(x, z, 0, &vec![v; 64]).unwrap();
+            store.write(x, z, 0, &[v; 64]).unwrap();
         }
     }
     store.flush().unwrap();

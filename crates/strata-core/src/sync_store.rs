@@ -53,6 +53,18 @@ impl SyncStore {
         self.write_lock()?.write(x, z, type_id, nbt)
     }
 
+    /// 写入一条记录并确保返回时已持久（写锁；每条两次 fsync，
+    /// 仅供"成功后删除主副本"的调用路径使用）。
+    pub fn write_durable(
+        &self,
+        x: i32,
+        z: i32,
+        type_id: u16,
+        nbt: &[u8],
+    ) -> Result<(), StrataError> {
+        self.write_lock()?.write_durable(x, z, type_id, nbt)
+    }
+
     /// 批量写入：按配置串行/有界并行压缩 + 串行落盘（写锁）。
     pub fn write_batch(&self, items: &[BatchItem]) -> Result<BatchWriteResult, StrataError> {
         self.write_lock()?.write_batch(items)

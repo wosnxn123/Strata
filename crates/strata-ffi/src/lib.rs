@@ -183,6 +183,10 @@ pub(crate) fn core_open(
 }
 
 /// 写入一条记录（payload 为不透明字节，内部压缩）。C ABI 与 JNI 共用。
+///
+/// **持久化契约**：走 [`SyncStore::write_durable`]——返回成功即已 sync。
+/// 调用方（Java hook）依赖"write 成功后删除 Anvil 主副本"，该删除使 vstore
+/// 成为唯一副本，故此处必须逐条持久（见审计 JAVA-02）。
 pub(crate) fn core_write(
     h: *mut c_void,
     x: i32,
@@ -192,7 +196,9 @@ pub(crate) fn core_write(
 ) -> Result<(), String> {
     // SAFETY: 句柄有效性契约见 `handle`。
     let store = unsafe { handle(h)? };
-    store.write(x, z, type_id, nbt).map_err(|e| e.to_string())
+    store
+        .write_durable(x, z, type_id, nbt)
+        .map_err(|e| e.to_string())
 }
 
 /// 读取最新版本；键不存在 → `None`。C ABI 与 JNI 共用。

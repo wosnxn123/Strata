@@ -13,7 +13,10 @@ fn second_open_fails_with_holder_info_until_drop() {
     let info = std::fs::read_to_string(dir.path().join(".strata.lock")).unwrap();
     assert!(info.contains("pid="), "lock file should carry holder info: {info}");
 
-    let err = Store::open(dir.path(), StoreConfig::default()).unwrap_err();
+    let err = match Store::open(dir.path(), StoreConfig::default()) {
+        Err(e) => e,
+        Ok(_) => panic!("second open must fail while the first session holds the lock"),
+    };
     match err {
         StrataError::Lock(msg) => {
             assert!(msg.contains(".strata.lock"), "{msg}");

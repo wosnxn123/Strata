@@ -37,11 +37,11 @@ fn punch_over_64kb_dead_span_survives_rescan_verify_rebuild() {
 
     // 30 × 4KB = 120KB 记录；覆盖中间 20 条 → 80KB+ 连续死区间 > 64KB 重同步窗口。
     for i in 0..30i32 {
-        s.write(i, 0, 0, &vec![i as u8; 4096]).unwrap();
+        s.write(i, 0, 0, &[i as u8; 4096]).unwrap();
     }
     s.flush().unwrap();
     for i in 5..25i32 {
-        s.write(i, 0, 0, &vec![i as u8; 64]).unwrap();
+        s.write(i, 0, 0, &[i as u8; 64]).unwrap();
     }
     s.flush().unwrap();
 
@@ -85,14 +85,14 @@ fn tail_dead_span_keeps_last_envelope_scannable() {
 
     // A B 为存活记录；C D E（各 32KB）位于段尾且全部失效：
     // 死区间 [C.start, EOF) 覆盖最后一条记录的信封壳（尾洞构造）。
-    s.write(0, 0, 0, &vec![0xAA; 16]).unwrap();
-    s.write(1, 0, 0, &vec![0xBB; 16]).unwrap();
+    s.write(0, 0, 0, &[0xAA; 16]).unwrap();
+    s.write(1, 0, 0, &[0xBB; 16]).unwrap();
     for i in 2..5i32 {
-        s.write(i, 0, 0, &vec![i as u8; 32 * 1024]).unwrap();
+        s.write(i, 0, 0, &[i as u8; 32 * 1024]).unwrap();
     }
     s.flush().unwrap();
     for i in 2..5i32 {
-        s.write(i, 0, 0, &vec![i as u8; 64]).unwrap();
+        s.write(i, 0, 0, &[i as u8; 64]).unwrap();
     }
     s.flush().unwrap();
 

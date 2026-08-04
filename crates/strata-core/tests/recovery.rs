@@ -126,7 +126,7 @@ fn replay_drops_entries_beyond_segment_length() {
         s.write(1, 1, 0, b"base").unwrap();
         s.flush().unwrap();
     }
-    let e = env(5, 5, 0, 5, &vec![0xAB; 100]);
+    let e = env(5, 5, 0, 5, &[0xAB; 100]);
     append_epoch(dir.path(), &epoch_entry_bytes(1, &e, 999_999));
 
     let s = Store::open(dir.path(), StoreConfig::default()).unwrap();

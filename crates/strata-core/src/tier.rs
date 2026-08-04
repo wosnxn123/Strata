@@ -156,7 +156,7 @@ impl Store {
             // 回放跳过冷区键（回写丢失）而槽位已失效——两个副本同时蒸发。
             self.demote_in_progress = true;
             let res: Result<(), StrataError> = keep.iter().try_for_each(|(env, nbt)| {
-                self.write(env.chunk_x, env.chunk_z, env.type_id, nbt)
+                self.write_durable(env.chunk_x, env.chunk_z, env.type_id, nbt)
                     .map_err(|e| {
                         StrataError::Manifest(format!(
                             "tier: 降级回写 ({}, {}, type={}) 至热层失败: {e}",
