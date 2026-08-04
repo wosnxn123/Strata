@@ -1,21 +1,21 @@
-From 3812aae4c4d51883e72200079ed4651ecd590a07 Mon Sep 17 00:00:00 2001
+From 087b2f392e0593b2d656a90242779583a2ddd8aa Mon Sep 17 00:00:00 2001
 From: wosnxn123 <wosnxn123@users.noreply.github.com>
-Date: Wed, 5 Aug 2026 00:22:33 +0800
+Date: Wed, 5 Aug 2026 03:50:42 +0800
 Subject: [PATCH] Strata Storage integration: weaver feature patches, Java
  support layer, /strata command
 
 ---
- .../features/0004-Strata-Storage.patch        | 244 +++++++++++
- .../features/0001-Strata-Storage.patch        |  22 +
- .../dev/strata/bridge/StrataException.java    |  25 ++
- .../java/dev/strata/bridge/StrataNative.java  | 293 +++++++++++++
+ .../features/0004-Strata-Storage.patch        | 251 ++++++++
+ .../features/0001-Strata-Storage.patch        |  23 +
+ .../dev/strata/bridge/StrataException.java    |  25 +
+ .../java/dev/strata/bridge/StrataNative.java  | 293 ++++++++++
  .../canvasmc/canvas/GlobalConfiguration.java  |   4 +-
- .../canvasmc/canvas/strata/StrataConfig.java  | 223 ++++++++++
- .../canvas/strata/StrataConverter.java        | 392 +++++++++++++++++
- .../canvasmc/canvas/strata/StrataStartup.java |  55 +++
- .../canvasmc/canvas/strata/StrataWorld.java   | 414 ++++++++++++++++++
- .../canvas/subcommands/StrataSubCommand.java  | 157 +++++++
- 10 files changed, 1828 insertions(+), 1 deletion(-)
+ .../canvasmc/canvas/strata/StrataConfig.java  | 232 ++++++++
+ .../canvas/strata/StrataConverter.java        | 468 +++++++++++++++
+ .../canvasmc/canvas/strata/StrataStartup.java |  55 ++
+ .../canvasmc/canvas/strata/StrataWorld.java   | 543 ++++++++++++++++++
+ .../canvas/subcommands/StrataSubCommand.java  | 163 ++++++
+ 10 files changed, 2056 insertions(+), 1 deletion(-)
  create mode 100644 canvas-server/minecraft-patches/features/0004-Strata-Storage.patch
  create mode 100644 canvas-server/paper-patches/features/0001-Strata-Storage.patch
  create mode 100644 canvas-server/src/main/java/dev/strata/bridge/StrataException.java
@@ -28,10 +28,10 @@ Subject: [PATCH] Strata Storage integration: weaver feature patches, Java
 
 diff --git a/canvas-server/minecraft-patches/features/0004-Strata-Storage.patch b/canvas-server/minecraft-patches/features/0004-Strata-Storage.patch
 new file mode 100644
-index 0000000..4680454
+index 0000000..c74b497
 --- /dev/null
 +++ b/canvas-server/minecraft-patches/features/0004-Strata-Storage.patch
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,251 @@
 +From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 +From: wosnxn123 <wosnxn123@users.noreply.github.com>
 +Date: Tue, 4 Aug 2026 20:11:42 +0800
@@ -184,18 +184,19 @@ index 0000000..4680454
 +     }
 + 
 +diff --git a/net/minecraft/server/Main.java b/net/minecraft/server/Main.java
-+index c53ced7b540ffeeadae3afd2304d2af77ddd8baa..2b3ab6e1b2cc35157ee922c53fc7875e2992b19c 100644
++index c53ced7b540ffeeadae3afd2304d2af77ddd8baa..0fca57ac0c1d13e82cb0f26d1b91b983a229ed80 100644
 +--- a/net/minecraft/server/Main.java
 ++++ b/net/minecraft/server/Main.java
-+@@ -225,6 +225,18 @@ public class Main {
++@@ -225,6 +225,19 @@ public class Main {
 +             }
 +             io.papermc.paper.world.migration.WorldFolderMigration.didInitialLoad = true; // Paper
 + 
 ++            // Canvas start - Strata storage one-shot startup conversion
 ++            if (options.has("strataConvertToStrata") || options.has("strataConvertToAnvil")) {
 ++                final boolean toStrata = options.has("strataConvertToStrata");
+++                final boolean force = options.has("strataForce");
 ++                try {
-++                    io.canvasmc.canvas.strata.StrataStartup.runConversion(access.getLevelDirectory().path(), toStrata);
+++                    io.canvasmc.canvas.strata.StrataStartup.runConversion(access.getLevelDirectory().path(), toStrata, force);
 ++                } catch (final Throwable ex) {
 ++                    LOGGER.error("Strata startup conversion failed; aborting startup to avoid a mixed-format world", ex);
 ++                    return;
@@ -207,22 +208,23 @@ index 0000000..4680454
 +             if (safeModeEnabled) {
 +                 LOGGER.warn("Safe mode active, only vanilla datapack will be loaded");
 +diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
-+index 3ea53abdbf0a089fdce5a650acac93dbd5c02410..5c913eec7cc89109b987df7f1faffc382a3eaf60 100644
++index 3ea53abdbf0a089fdce5a650acac93dbd5c02410..7a922bc0b3ec64ce23ae2e21bfe2c6dca41e9722 100644
 +--- a/net/minecraft/server/MinecraftServer.java
 ++++ b/net/minecraft/server/MinecraftServer.java
-+@@ -974,6 +974,11 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
++@@ -974,6 +974,12 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
 +             }
 + 
 +             LOGGER.info("ThreadedAnvilChunkStorage: All dimensions are saved");
-++            // Canvas start - Strata storage: flush the vstore on save-all / stop
+++            // Canvas start - Strata storage: flush the vstores on save-all / stop, then run scheduled maintenance
 ++            for (final io.canvasmc.canvas.strata.StrataWorld store : io.canvasmc.canvas.strata.StrataWorld.openStores()) {
 ++                store.flush();
+++                store.maybeRunMaintenance();
 ++            }
 ++            // Canvas end - Strata storage
 +         }
 + 
 +         return result;
-+@@ -1110,6 +1115,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
++@@ -1110,6 +1116,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
 +         this.savedDataStorage.close();
 +         this.resources.close();
 + 
@@ -231,7 +233,7 @@ index 0000000..4680454
 +             this.storageSource.close();
 +         } catch (IOException e) {
 +diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
-+index d5775f7367f380c0f69471cbd694aeef681d2da7..0936ed84ea82a2f9cd2d91ad481baf3ab2ac0379 100644
++index d5775f7367f380c0f69471cbd694aeef681d2da7..754751819dea73446ccb859dd13bfc0f20af5c0e 100644
 +--- a/net/minecraft/server/level/ServerLevel.java
 ++++ b/net/minecraft/server/level/ServerLevel.java
 +@@ -329,6 +329,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
@@ -256,7 +258,7 @@ index 0000000..4680454
 +     @Override
 +     public final int moonrise$getRegionChunkShift() {
 +         return this.regioniser.sectionChunkShift; // Folia - region threading
-+@@ -714,6 +722,19 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
++@@ -714,6 +722,24 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
 +         int simulationDistance = this.serverLevelData.canvas$distanceConfig.simulationDistanceOrDefault();
 +         this.chunkSource.setSimulationDistance(simulationDistance);
 +         // Canvas end - per world distance
@@ -269,7 +271,12 @@ index 0000000..4680454
 ++        if (levelStorage != null) {
 ++            final java.nio.file.Path canvas$strataDimDir = levelStorage.getDimensionPath(dimension);
 ++            final java.nio.file.Path canvas$strataConfigRoot = levelStorage.getLevelPath(net.minecraft.world.level.storage.LevelResource.ROOT);
-++            canvas$strataWorldInit = io.canvasmc.canvas.strata.StrataWorld.openFor(canvas$strataConfigRoot, canvas$strataDimDir, dimension == net.minecraft.world.level.Level.OVERWORLD);
+++            try {
+++                canvas$strataWorldInit = io.canvasmc.canvas.strata.StrataWorld.openFor(canvas$strataConfigRoot, canvas$strataDimDir, dimension == net.minecraft.world.level.Level.OVERWORLD);
+++            } catch (final IllegalStateException ex) {
+++                // fail-closed: vstore present but Strata not active - never boot on stale Anvil silently
+++                throw new IllegalStateException("[Strata] cannot start level " + dimension.identifier() + ": " + ex.getMessage(), ex);
+++            }
 ++        }
 ++        this.canvas$strataWorld = canvas$strataWorldInit;
 ++        // Canvas end - Strata storage
@@ -278,10 +285,10 @@ index 0000000..4680454
 +     // Folia start - region threading
 diff --git a/canvas-server/paper-patches/features/0001-Strata-Storage.patch b/canvas-server/paper-patches/features/0001-Strata-Storage.patch
 new file mode 100644
-index 0000000..f4b0ef6
+index 0000000..b7bdd6c
 --- /dev/null
 +++ b/canvas-server/paper-patches/features/0001-Strata-Storage.patch
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,23 @@
 +From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 +From: wosnxn123 <wosnxn123@users.noreply.github.com>
 +Date: Tue, 4 Aug 2026 20:11:42 +0800
@@ -289,16 +296,17 @@ index 0000000..f4b0ef6
 +
 +
 +diff --git a/src/main/java/org/bukkit/craftbukkit/Main.java b/src/main/java/org/bukkit/craftbukkit/Main.java
-+index 8ce8de8eedfe8557848b0508857744a5b9641239..d4092fb106bdb12b27b49f5e5be382a213874e45 100644
++index 8ce8de8eedfe8557848b0508857744a5b9641239..60d6082adfeb5040546c3efd1a486a93123386e8 100644
 +--- a/src/main/java/org/bukkit/craftbukkit/Main.java
 ++++ b/src/main/java/org/bukkit/craftbukkit/Main.java
-+@@ -50,6 +50,11 @@ public class Main {
++@@ -50,6 +50,12 @@ public class Main {
 +                         .defaultsTo(new File("."))
 +                         .describedAs("Directory containing worlds");
 + 
 ++                // Canvas start - Strata storage one-shot startup conversion
 ++                this.accepts("strataConvertToStrata", "Convert the overworld from Anvil to the Strata vstore before startup, then continue booting");
 ++                this.accepts("strataConvertToAnvil", "Convert the overworld from the Strata vstore back to Anvil before startup, then continue booting");
+++                this.accepts("strataForce", "Combine with --strataConvertToStrata/--strataConvertToAnvil: overwrite an existing vstore / export the vstore despite the data-loss warning");
 ++                // Canvas end - Strata storage one-shot startup conversion
 ++
 +                 this.acceptsAll(asList("w", "world", "level-name"), "World name")
@@ -658,10 +666,10 @@ index fb54220..858722b 100644
  
 diff --git a/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataConfig.java b/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataConfig.java
 new file mode 100644
-index 0000000..96de925
+index 0000000..ea4d10a
 --- /dev/null
 +++ b/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataConfig.java
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,232 @@
 +package io.canvasmc.canvas.strata;
 +
 +import java.io.IOException;
@@ -685,7 +693,6 @@ index 0000000..96de925
 + * strata.compression.cold=zstd-9
 + * strata.compression.hot-enabled=true
 + * strata.compression.cold-enabled=true
-+ * strata.compression.dictionary=true
 + * strata.compression.threads=1             # batch compression workers (default serial)
 + * strata.index.cache-mb=512
 + * strata.tiering.enabled=true
@@ -695,6 +702,7 @@ index 0000000..96de925
 + * strata.gc.invalid-threshold=0.6
 + * strata.gc.budget-bytes=33554432
 + * strata.gc.min-hole-bytes=65536
++ * strata.force-anvil=false                 # emergency escape: boot on Anvil although a vstore exists
 + * </pre>
 + * An explicit {@code strata.enabled=false} short-circuits parsing exactly
 + * like the CLI. Unknown keys are reported as warnings, never fatal.
@@ -719,6 +727,7 @@ index 0000000..96de925
 +    public boolean tieringEnabled = true;
 +    public int tieringStableFlushes = 30;
 +    public double tieringDemoteRatio = 0.25;
++    public boolean forceAnvil = false;
 +
 +    public final List<String> warnings = new ArrayList<>();
 +
@@ -758,6 +767,9 @@ index 0000000..96de925
 +        final String enabledRaw = trimToNull(properties.getProperty("strata.enabled"));
 +        if ("false".equalsIgnoreCase(enabledRaw)) {
 +            config.enabled = false;
++            // parse the escape hatch before short-circuiting: a disabled store
++            // with an existing vstore still needs to know about force-anvil
++            config.forceAnvil = parseBool(config, file, "strata.force-anvil", trimToNull(properties.getProperty("strata.force-anvil")), false);
 +            return config;
 +        }
 +        config.enabled = "true".equalsIgnoreCase(enabledRaw);
@@ -770,7 +782,7 @@ index 0000000..96de925
 +                case "strata.compression.cold" -> applyCodec(config, file, key, value, false);
 +                case "strata.compression.hot-enabled" -> config.hotEnabled = parseBool(config, file, key, value, true);
 +                case "strata.compression.cold-enabled" -> config.coldEnabled = parseBool(config, file, key, value, true);
-+                case "strata.compression.dictionary" -> config.dictionary = parseBool(config, file, key, value, true);
++                case "strata.compression.dictionary" -> config.warnings.add(file.getFileName() + ": strata.compression.dictionary 已停用，忽略 (retired key, ignored)");
 +                case "strata.compression.threads" -> config.compressionThreads = (int) parseLong(config, file, key, value, config.compressionThreads);
 +                case "strata.index.cache-mb" -> config.cacheMb = parseLong(config, file, key, value, config.cacheMb);
 +                case "strata.gc.enabled" -> config.gcEnabled = parseBool(config, file, key, value, true);
@@ -780,6 +792,7 @@ index 0000000..96de925
 +                case "strata.tiering.enabled" -> config.tieringEnabled = parseBool(config, file, key, value, true);
 +                case "strata.tiering.stable-flushes" -> config.tieringStableFlushes = (int) parseLong(config, file, key, value, config.tieringStableFlushes);
 +                case "strata.tiering.invalid-demote-ratio" -> config.tieringDemoteRatio = parseDouble(config, file, key, value, config.tieringDemoteRatio);
++                case "strata.force-anvil" -> config.forceAnvil = parseBool(config, file, key, value, false);
 +                default -> config.warnings.add(file.getFileName() + ": ignoring unknown key '" + key + "'");
 +            }
 +        }
@@ -873,7 +886,6 @@ index 0000000..96de925
 +        strata.compression.cold-enabled=true
 +        strata.compression.hot=zstd-3
 +        strata.compression.cold=zstd-9
-+        strata.compression.dictionary=true
 +        # Batch compression workers: 0=auto(all cores) 1=serial(default, TPS-first) N>=2=capped
 +        # 批量压缩线程：0=自动(全核) 1=串行(默认,TPS优先) N≥2=限N线程
 +        strata.compression.threads=1
@@ -883,14 +895,19 @@ index 0000000..96de925
 +        strata.gc.enabled=true
 +        strata.gc.invalid-threshold=0.6
 +        strata.gc.budget-bytes=33554432
++        # Minimum hole bytes for punch / 挖洞最小洞阈值（字节）
++        strata.gc.min-hole-bytes=65536
++        # Emergency escape: boot on Anvil even when a vstore exists (data in vstore invisible until converted back)
++        # 应急逃生门：vstore 存在时仍按 Anvil 启动（vstore 内数据在转回前不可见）
++        strata.force-anvil=false
 +        """;
 +}
 diff --git a/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataConverter.java b/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataConverter.java
 new file mode 100644
-index 0000000..91a9d37
+index 0000000..c7841c9
 --- /dev/null
 +++ b/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataConverter.java
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,468 @@
 +package io.canvasmc.canvas.strata;
 +
 +import dev.strata.bridge.StrataNative;
@@ -911,8 +928,11 @@ index 0000000..91a9d37
 +import java.util.Map;
 +import java.util.function.LongConsumer;
 +import java.util.zip.DeflaterOutputStream;
++import java.util.zip.GZIPOutputStream;
 +import java.util.zip.InflaterInputStream;
 +import java.util.zip.GZIPInputStream;
++import net.minecraft.nbt.NbtAccounter;
++import net.minecraft.nbt.NbtIo;
 +import org.slf4j.Logger;
 +import org.slf4j.LoggerFactory;
 +
@@ -922,13 +942,23 @@ index 0000000..91a9d37
 + *
 + * <ul>
 + *   <li>{@code convertToStrata}: reads every {@code .mca} region file in
-+ *       {@code region/}, {@code entities/} and {@code poi/}, writes each
-+ *       chunk's NBT into a fresh vstore (overwriting any existing one), and
-+ *       leaves the Anvil sources in place;</li>
++ *       {@code region/}, {@code entities/} and {@code poi/} and writes each
++ *       chunk's NBT into a fresh {@code <dimRoot>/vstore}, leaving the Anvil
++ *       sources in place. A dimension that already has a vstore is refused
++ *       unless {@code force} is set (the existing vstore may hold newer
++ *       data than the Anvil files);</li>
 + *   <li>{@code convertToAnvil}: aggregates the newest record per key that is
 + *       reachable through the Anvil key manifest and rewrites the region
-+ *       files, leaving the vstore in place.</li>
++ *       files, leaving the vstore in place. Refused unless {@code force} is
++ *       set, because records written while the server ran live only in the
++ *       vstore and are not enumerated by the Anvil manifest — the lossless
++ *       full export is {@code strata-cli convert --to-anvil}.</li>
 + * </ul>
++ *
++ * <p>Record payloads use the runtime wire format, gzip(NBT)
++ * ({@code NbtIo.writeCompressed}/{@code readCompressed}). On the way back to
++ * Anvil, records that fail gzip parsing are accepted as legacy bare-NBT
++ * payloads (validated, counted, and reported).</p>
 + *
 + * <p>Both entry points detect every dimension root under the given world
 + * root ({@link StrataWorld#dimensionRoots(Path)}) and convert each one
@@ -950,6 +980,8 @@ index 0000000..91a9d37
 +    private static final int VER_DEFLATE = 2;
 +    private static final int VER_NONE = 3;
 +    private static final int VER_EXTERNAL_MASK = 0x80;
++    /** Largest compressed payload that still fits a 255-sector Anvil record: 255*4096 - 4 (length) - 1 (version). */
++    private static final int MAX_COMPRESSED_BYTES = 255 * SECTOR - 5;
 +
 +    private static final String[] SOURCE_DIRS = {"region", "entities", "poi"};
 +    private static final int[] TYPE_IDS = {StrataNative.TYPE_CHUNK, StrataNative.TYPE_ENTITY, StrataNative.TYPE_POI};
@@ -961,8 +993,12 @@ index 0000000..91a9d37
 +    private record ChunkRecord(int localX, int localZ, byte[] nbt) {
 +    }
 +
-+    /** Aggregate result counters. */
-+    public record Report(long regions, long records, long skipped) {
++    /**
++     * Aggregate result counters. {@code legacyRaw} counts vstore records
++     * read back as legacy bare NBT (no gzip wrapper) during
++     * {@code convertToAnvil}.
++     */
++    public record Report(long regions, long records, long skipped, long legacyRaw) {
 +    }
 +
 +    /**
@@ -970,30 +1006,37 @@ index 0000000..91a9d37
 +     * Strata. Dimensions are detected CLI-parity
 +     * ({@link StrataWorld#dimensionRoots(Path)}); each dimension's
 +     * {@code region/}, {@code entities/} and {@code poi/} files are read
-+     * into its own fresh {@code <dimRoot>/vstore} (overwriting any existing
-+     * one), and the Anvil sources stay in place (operators verify, then
-+     * delete them manually — same contract as the CLI). Every dimension is
-+     * reported individually; the returned report aggregates all of them.
++     * into its own fresh {@code <dimRoot>/vstore}, and the Anvil sources
++     * stay in place (operators verify, then delete them manually — same
++     * contract as the CLI). A dimension that already has a vstore is
++     * refused unless {@code force} is set. Every dimension is reported
++     * individually; the returned report aggregates all of them.
 +     */
-+    public static Report convertToStrata(final Path worldDir, final StrataConfig config) throws IOException {
++    public static Report convertToStrata(final Path worldDir, final StrataConfig config, final boolean force) throws IOException {
 +        long regions = 0L;
 +        long records = 0L;
 +        for (final Path dimRoot : conversionRoots(worldDir)) {
-+            final Report report = convertDimToStrata(dimRoot, config);
++            final Report report = convertDimToStrata(dimRoot, config, force);
 +            regions += report.regions();
 +            records += report.records();
 +        }
-+        return new Report(regions, records, 0L);
++        return new Report(regions, records, 0L, 0L);
 +    }
 +
 +    /** Conversion core: one dimension root from Anvil to Strata. */
-+    private static Report convertDimToStrata(final Path dimDir, final StrataConfig config) throws IOException {
++    private static Report convertDimToStrata(final Path dimDir, final StrataConfig config, final boolean force) throws IOException {
 +        final Path vstore = dimDir.resolve("vstore");
-+        if (Files.isDirectory(vstore)) {
-+            deleteRecursively(vstore);
-+        }
 +        if (!StrataWorld.ensureNative()) {
 +            throw new IOException("Strata native library is unavailable; cannot convert");
++        }
++        if (Files.isDirectory(vstore)) {
++            if (!force) {
++                throw new IOException(dimDir + ": a vstore already exists at " + vstore
++                    + " and may hold newer data than the Anvil files; refusing to overwrite it. "
++                    + "Re-run with -f/--force (command) or --strataForce (startup flag) to replace it, "
++                    + "or use strata-cli convert --to-anvil first to bring the Anvil files up to date.");
++            }
++            deleteRecursively(vstore);
 +        }
 +        long handle = 0L;
 +        try {
@@ -1017,7 +1060,8 @@ index 0000000..91a9d37
 +                    for (final ChunkRecord chunk : chunks) {
 +                        final int chunkX = base[0] * 32 + chunk.localX();
 +                        final int chunkZ = base[1] * 32 + chunk.localZ();
-+                        StrataNative.write(handle, chunkX, chunkZ, TYPE_IDS[kind], chunk.nbt());
++                        // runtime wire format: gzip(NBT), same as NbtIo.writeCompressed
++                        StrataNative.write(handle, chunkX, chunkZ, TYPE_IDS[kind], compressGzip(chunk.nbt()));
 +                        records++;
 +                    }
 +                    StrataNative.flush(handle);
@@ -1026,7 +1070,7 @@ index 0000000..91a9d37
 +            }
 +            StrataNative.flush(handle);
 +            LOGGER.info("Converted {} regions ({} records) from Anvil to vstore {}", regions, records, vstore);
-+            return new Report(regions, records, 0L);
++            return new Report(regions, records, 0L, 0L);
 +        } finally {
 +            if (handle != 0L) {
 +                StrataNative.close(handle);
@@ -1041,39 +1085,47 @@ index 0000000..91a9d37
 +     * same: the vstore is enumerated by scanning segment files, which the
 +     * FFI does not expose), rewriting each region file atomically via a temp
 +     * file. The vstore stays in place. Dimensions without a vstore are
-+     * skipped; when no dimension has one the call fails. Every dimension is
-+     * reported individually; the returned report aggregates all of them.
++     * skipped; when no dimension has one the call fails. Refused unless
++     * {@code force} is set (see class javadoc). Every dimension is reported
++     * individually; the returned report aggregates all of them.
 +     */
-+    public static Report convertToAnvil(final Path worldDir, final StrataConfig config) throws IOException {
++    public static Report convertToAnvil(final Path worldDir, final StrataConfig config, final boolean force) throws IOException {
 +        long regions = 0L;
 +        long records = 0L;
 +        long skipped = 0L;
++        long legacyRaw = 0L;
 +        boolean convertedAny = false;
 +        for (final Path dimRoot : conversionRoots(worldDir)) {
 +            if (!Files.isDirectory(dimRoot.resolve("vstore"))) {
 +                LOGGER.info("No vstore under {}, skipping this dimension", dimRoot);
 +                continue;
 +            }
-+            final Report report = convertDimToAnvil(dimRoot, config);
++            final Report report = convertDimToAnvil(dimRoot, config, force);
 +            convertedAny = true;
 +            regions += report.regions();
 +            records += report.records();
 +            skipped += report.skipped();
++            legacyRaw += report.legacyRaw();
 +        }
 +        if (!convertedAny) {
 +            throw new IOException(worldDir + ": no vstore directory, nothing to convert");
 +        }
-+        return new Report(regions, records, skipped);
++        return new Report(regions, records, skipped, legacyRaw);
 +    }
 +
 +    /** Conversion core: one dimension root from Strata back to Anvil. */
-+    private static Report convertDimToAnvil(final Path dimDir, final StrataConfig config) throws IOException {
++    private static Report convertDimToAnvil(final Path dimDir, final StrataConfig config, final boolean force) throws IOException {
 +        final Path vstore = dimDir.resolve("vstore");
 +        if (!Files.isDirectory(vstore)) {
 +            throw new IOException(dimDir + ": no vstore directory, nothing to convert");
 +        }
 +        if (!StrataWorld.ensureNative()) {
 +            throw new IOException("Strata native library is unavailable; cannot convert");
++        }
++        if (!force) {
++            throw new IOException(dimDir + ": refusing to export the vstore to Anvil without -f/--force (command) or --strataForce (startup flag): "
++                + "records written while the server was running exist only in the vstore and are not enumerated by the Anvil key manifest, "
++                + "so this in-server export can miss them. For a lossless full export use 'strata-cli convert --to-anvil'.");
 +        }
 +        long handle = 0L;
 +        try {
@@ -1087,6 +1139,7 @@ index 0000000..91a9d37
 +            long regions = 0L;
 +            long records = 0L;
 +            long skipped = 0L;
++            long legacyRaw = 0L;
 +            for (int kind = 0; kind < SOURCE_DIRS.length; kind++) {
 +                final Path dir = dimDir.resolve(SOURCE_DIRS[kind]);
 +                if (!Files.isDirectory(dir)) {
@@ -1098,10 +1151,19 @@ index 0000000..91a9d37
 +                    for (final ChunkRecord key : readRegion(regionFile)) {
 +                        final int chunkX = base[0] * 32 + key.localX();
 +                        final int chunkZ = base[1] * 32 + key.localZ();
-+                        final byte[] nbt = StrataNative.read(handle, chunkX, chunkZ, TYPE_IDS[kind]);
-+                        if (nbt != null && nbt.length > 0) {
++                        final byte[] payload = StrataNative.read(handle, chunkX, chunkZ, TYPE_IDS[kind]);
++                        if (payload != null && payload.length > 0) {
++                            byte[] nbt;
++                            try {
++                                nbt = decompressGzip(payload);
++                            } catch (final IOException gzipError) {
++                                // legacy record written before the gzip(NBT) payload contract: bare NBT
++                                validateBareNbt(dimDir, chunkX, chunkZ, payload);
++                                nbt = payload;
++                                legacyRaw++;
++                            }
 +                            rewritten.add(new ChunkRecord(key.localX(), key.localZ(), nbt));
-+                        } else if (nbt == null) {
++                        } else if (payload == null) {
 +                            // key not in the vstore: keep the existing Anvil data
 +                            rewritten.add(key);
 +                            skipped++;
@@ -1117,7 +1179,10 @@ index 0000000..91a9d37
 +            StrataNative.flush(handle);
 +            LOGGER.info("Converted {} regions ({} records) from vstore {} back to Anvil ({} kept from Anvil)",
 +                regions, records, vstore, skipped);
-+            return new Report(regions, records, skipped);
++            if (legacyRaw > 0L) {
++                LOGGER.warn("{}: decoded {} legacy raw records (bare NBT without gzip wrapper) from the vstore", dimDir, legacyRaw);
++            }
++            return new Report(regions, records, skipped, legacyRaw);
 +        } finally {
 +            if (handle != 0L) {
 +                StrataNative.close(handle);
@@ -1154,21 +1219,25 @@ index 0000000..91a9d37
 +            if (count == 0) {
 +                continue;
 +            }
-+            final int start = offset * SECTOR;
-+            final int end = start + count * SECTOR;
-+            if (start + 5 > data.length || end > data.length) {
-+                throw new IOException(file + ": chunk slot " + index + " references bytes outside the file");
++            // all arithmetic in long: a hostile offset/count pair must not
++            // wrap around and pass the bounds check
++            final long start = (long) offset * SECTOR;
++            final long end = start + (long) count * SECTOR;
++            if (start < HEADER_BYTES || start + 5L > data.length || end > data.length) {
++                throw new IOException(file + ": chunk slot " + index + " references bytes outside the file"
++                    + " (offset " + offset + ", sectors " + count + ", file " + data.length + " bytes)");
 +            }
-+            final int recordLen = buffer.getInt(start);
-+            if (recordLen <= 0 || start + 4 + recordLen > data.length) {
++            final int startInt = (int) start;
++            final int recordLen = buffer.getInt(startInt);
++            if (recordLen <= 0 || (long) recordLen > (long) data.length - startInt - 4L) {
 +                throw new IOException(file + ": chunk slot " + index + " has bad record length " + recordLen);
 +            }
-+            final int version = data[start + 4] & 0xFF;
++            final int version = data[startInt + 4] & 0xFF;
 +            if ((version & VER_EXTERNAL_MASK) != 0) {
 +                throw new IOException(file + ": unsupported external chunk at slot " + index);
 +            }
 +            final byte[] payload = new byte[recordLen - 1];
-+            System.arraycopy(data, start + 5, payload, 0, payload.length);
++            System.arraycopy(data, startInt + 5, payload, 0, payload.length);
 +            final byte[] nbt = switch (version) {
 +                case VER_GZIP -> decompressGzip(payload);
 +                case VER_DEFLATE -> decompressDeflate(payload);
@@ -1186,6 +1255,12 @@ index 0000000..91a9d37
 +        final int[] lengths = new int[chunks.size()];
 +        for (int i = 0; i < chunks.size(); i++) {
 +            final byte[] compressed = compressDeflate(chunks.get(i).nbt());
++            if (compressed.length > MAX_COMPRESSED_BYTES) {
++                final ChunkRecord chunk = chunks.get(i);
++                throw new IOException(file + ": chunk at local (" + (chunk.localX() & 31) + ", " + (chunk.localZ() & 31)
++                    + ") compresses to " + compressed.length + " bytes, exceeding the Anvil 255-sector record limit of "
++                    + MAX_COMPRESSED_BYTES + " bytes; refusing to truncate");
++            }
 +            // record = 4-byte length + 1 version byte + compressed payload
 +            lengths[i] = compressed.length + 1;
 +            records[i] = compressed;
@@ -1231,6 +1306,14 @@ index 0000000..91a9d37
 +        }
 +    }
 +
++    private static byte[] compressGzip(final byte[] nbt) throws IOException {
++        final ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(64, nbt.length / 2));
++        try (final GZIPOutputStream gzip = new GZIPOutputStream(out)) {
++            gzip.write(nbt);
++        }
++        return out.toByteArray();
++    }
++
 +    private static byte[] decompressDeflate(final byte[] payload) throws IOException {
 +        try (final ByteArrayInputStream in = new ByteArrayInputStream(payload);
 +             final InflaterInputStream inflater = new InflaterInputStream(in);
@@ -1246,6 +1329,16 @@ index 0000000..91a9d37
 +            deflater.write(nbt);
 +        }
 +        return out.toByteArray();
++    }
++
++    /** Ensures a legacy bare-NBT payload actually parses before it is written back to Anvil. */
++    private static void validateBareNbt(final Path dimDir, final int chunkX, final int chunkZ, final byte[] payload) throws IOException {
++        try {
++            NbtIo.read(new DataInputStream(new ByteArrayInputStream(payload)), NbtAccounter.unlimitedHeap());
++        } catch (final IOException e) {
++            throw new IOException(dimDir + ": vstore record at (" + chunkX + ", " + chunkZ
++                + ") is neither gzip(NBT) nor valid bare NBT: " + e.getMessage(), e);
++        }
 +    }
 +
 +    private static List<Path> listRegionFiles(final Path dir) throws IOException {
@@ -1285,7 +1378,7 @@ index 0000000..91a9d37
 +}
 diff --git a/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataStartup.java b/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataStartup.java
 new file mode 100644
-index 0000000..1209644
+index 0000000..e18f7a4
 --- /dev/null
 +++ b/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataStartup.java
 @@ -0,0 +1,55 @@
@@ -1313,17 +1406,17 @@ index 0000000..1209644
 +    private StrataStartup() {
 +    }
 +
-+    public static void runConversion(final Path worldDir, final boolean toStrata) {
-+        LOGGER.info("Strata startup conversion requested ({} -> {}) for {}",
-+            toStrata ? "Anvil" : "vstore", toStrata ? "vstore" : "Anvil", worldDir);
++    public static void runConversion(final Path worldDir, final boolean toStrata, final boolean force) {
++        LOGGER.info("Strata startup conversion requested ({} -> {}) for {}{}",
++            toStrata ? "Anvil" : "vstore", toStrata ? "vstore" : "Anvil", worldDir, force ? " [force]" : "");
 +        final StrataConfig config = StrataConfig.load(worldDir, true);
 +        for (final String warning : config.warnings) {
 +            LOGGER.warn("Strata config: {}", warning);
 +        }
 +        try {
 +            final StrataConverter.Report report = toStrata
-+                ? StrataConverter.convertToStrata(worldDir, config)
-+                : StrataConverter.convertToAnvil(worldDir, config);
++                ? StrataConverter.convertToStrata(worldDir, config, force)
++                : StrataConverter.convertToAnvil(worldDir, config, force);
 +            if (toStrata) {
 +                LOGGER.info("Converted {} regions ({} records) to {}", report.regions(), report.records(), worldDir.resolve("vstore"));
 +                LOGGER.info("Anvil sources retained in region/, entities/, poi/ — verify the world, then delete them manually.");
@@ -1333,8 +1426,8 @@ index 0000000..1209644
 +                }
 +                LOGGER.info("Remove the --strataConvertToStrata flag before the next start, or the vstore will be rebuilt again.");
 +            } else {
-+                LOGGER.info("Converted {} regions ({} records) back to Anvil ({} records kept from existing Anvil)",
-+                    report.regions(), report.records(), report.skipped());
++                LOGGER.info("Converted {} regions ({} records) back to Anvil ({} records kept from existing Anvil{})",
++                    report.regions(), report.records(), report.skipped(), report.legacyRaw() > 0 ? ", " + report.legacyRaw() + " legacy raw records" : "");
 +                LOGGER.info("vstore retained at {} — verify the world, then delete it manually.", worldDir.resolve("vstore"));
 +                LOGGER.info("Remove the --strataConvertToAnvil flag before the next start, or the region files will be rewritten again.");
 +            }
@@ -1346,10 +1439,10 @@ index 0000000..1209644
 +}
 diff --git a/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataWorld.java b/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataWorld.java
 new file mode 100644
-index 0000000..3615c1b
+index 0000000..49eb44e
 --- /dev/null
 +++ b/canvas-server/src/main/java/io/canvasmc/canvas/strata/StrataWorld.java
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,543 @@
 +package io.canvasmc.canvas.strata;
 +
 +import dev.strata.bridge.StrataException;
@@ -1364,6 +1457,9 @@ index 0000000..3615c1b
 +import java.util.List;
 +import java.util.Map;
 +import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
 +import net.minecraft.nbt.CompoundTag;
 +import net.minecraft.nbt.NbtAccounter;
 +import net.minecraft.nbt.NbtIo;
@@ -1380,8 +1476,16 @@ index 0000000..3615c1b
 + * live next to their Anvil directories and remain CLI-compatible. The
 + * {@code strata.properties} configuration is shared per world root.</p>
 + *
-+ * <p>Every failure path degrades to plain Anvil: a missing or broken native
-+ * library can never take the server down.</p>
++ * <p>Fail-closed: when a vstore with data already exists but Strata cannot
++ * take it over (disabled, native library missing, open failure),
++ * {@link #openFor} refuses to start the level instead of silently serving
++ * Anvil — the vstore's data would otherwise be invisible. The
++ * {@code strata.force-anvil=true} escape hatch overrides that refusal with
++ * a loud warning on every start.</p>
++ *
++ * <p>Handle operations take a shared lock; {@link #close()} takes the
++ * exclusive lock, so it only runs once every in-flight operation has
++ * drained, and no new operation can reach the native handle afterwards.</p>
 + */
 +public final class StrataWorld {
 +
@@ -1391,13 +1495,17 @@ index 0000000..3615c1b
 +    private static boolean nativeLoadFailed;
 +    private static volatile boolean nativeLoaded;
 +
-+    /** Open stores keyed by the absolute, normalized dimension directory. */
++    /** Open stores keyed by the real (symlink/case/junction-resolved) dimension directory. */
 +    private static final Map<Path, StrataWorld> REGISTRY = new ConcurrentHashMap<>();
 +
 +    private final Path configRoot;
 +    private final Path dimDir;
 +    private final Path vstore;
 +    private final StrataConfig config;
++    /** Guards every native-handle operation; close() takes the write lock. */
++    private final ReadWriteLock opLock = new ReentrantReadWriteLock();
++    /** Successful flushes since the last maintenance pass (gc + tier). */
++    private final AtomicInteger successfulFlushes = new AtomicInteger();
 +    private volatile long handle;
 +
 +    private StrataWorld(final Path configRoot, final Path dimDir, final StrataConfig config, final long handle) {
@@ -1449,12 +1557,32 @@ index 0000000..3615c1b
 +    }
 +
 +    /**
++     * Registry key for a dimension directory: the real filesystem path, so
++     * case-folded, 8.3 and junction/symlink spellings of the same directory
++     * map onto one store; falls back to absolute+normalized when the path
++     * cannot be resolved (e.g. not yet created).
++     */
++    private static Path registryKey(final Path dir) {
++        try {
++            return dir.toRealPath();
++        } catch (final IOException e) {
++            return dir.toAbsolutePath().normalize();
++        }
++    }
++
++    /**
 +     * Opens (or reuses) the vstore for one dimension directory
 +     * {@code dimDir} ({@code <dimDir>/vstore}), reading the shared
 +     * {@code strata.properties} from {@code configRoot} (the world root).
-+     * Returns {@code null} when Strata is disabled there or anything fails
-+     * to open — in both cases the caller keeps its original Anvil behavior
-+     * untouched.
++     * Returns {@code null} when Strata is disabled there and no vstore data
++     * would be left invisible.
++     *
++     * <p>Fail-closed: when a vstore already holds data
++     * ({@code vstore/manifest.vsm} exists) but Strata cannot serve it this
++     * run, this method throws {@link IllegalStateException} instead of
++     * returning {@code null} — silently booting on Anvil would hide the
++     * vstore's records. {@code strata.force-anvil=true} explicitly accepts
++     * that risk (with a loud warning on every start).</p>
 +     *
 +     * @param writeTemplateIfMissing creates the CLI template
 +     *                               {@code strata.properties} on first start
@@ -1463,7 +1591,7 @@ index 0000000..3615c1b
 +     */
 +    public static StrataWorld openFor(final Path configRoot, final Path dimDir, final boolean writeTemplateIfMissing) {
 +        final Path root = configRoot.toAbsolutePath().normalize();
-+        final Path dim = dimDir.toAbsolutePath().normalize();
++        final Path dim = registryKey(dimDir);
 +        final StrataWorld existing = REGISTRY.get(dim);
 +        if (existing != null) {
 +            return existing;
@@ -1472,14 +1600,17 @@ index 0000000..3615c1b
 +        for (final String warning : config.warnings) {
 +            LOGGER.warn("Strata config: {}", warning);
 +        }
++        final Path vstore = dim.resolve("vstore");
++        final boolean vstorePresent = Files.isRegularFile(vstore.resolve("manifest.vsm"));
 +        if (!config.enabled) {
++            refuseInvisibleData(dim, vstore, vstorePresent, config, "strata.enabled is not true");
 +            return null;
 +        }
 +        if (!ensureNative()) {
++            refuseInvisibleData(dim, vstore, vstorePresent, config, "the Strata native library failed to load");
 +            return null;
 +        }
 +        try {
-+            final Path vstore = dim.resolve("vstore");
 +            Files.createDirectories(vstore);
 +            final long handle = StrataNative.open(
 +                vstore.toString(),
@@ -1490,11 +1621,6 @@ index 0000000..3615c1b
 +                config.segmentMaxBytes,
 +                config.compressionThreads
 +            );
-+            if (handle == 0L) {
-+                LOGGER.warn("[strata] store open returned null handle for {} ({}), falling back to Anvil",
-+                    dim, StrataNative.lastError());
-+                return null;
-+            }
 +            final StrataWorld store = new StrataWorld(root, dim, config, handle);
 +            final StrataWorld race = REGISTRY.putIfAbsent(dim, store);
 +            if (race != null) {
@@ -1502,23 +1628,37 @@ index 0000000..3615c1b
 +                return race;
 +            }
 +            LOGGER.info("[strata] virtual store online for {} (config={}, vstore={})", dim, root, vstore);
-+            if (config.tieringEnabled) {
-+                try {
-+                    StrataNative.tier(handle, true, config.tieringStableFlushes, config.tieringDemoteRatio);
-+                } catch (final StrataException e) {
-+                    LOGGER.warn("[strata] tiering enable failed for {}: {}", dim, e.getMessage());
-+                }
-+            }
 +            return store;
 +        } catch (final IOException | RuntimeException e) { // StrataException is a RuntimeException
++            refuseInvisibleData(dim, vstore, vstorePresent, config, "the vstore failed to open: " + e.getMessage());
 +            LOGGER.warn("[strata] store unavailable for {}, falling back to Anvil: {}", dim, e.getMessage());
 +            return null;
 +        }
 +    }
 +
++    /**
++     * Fail-closed guard: a vstore with data exists but Strata will not serve
++     * it this run. Refuses to boot the level unless {@code strata.force-anvil}
++     * explicitly accepts that its data stays invisible (warned on every
++     * start either way).
++     */
++    private static void refuseInvisibleData(final Path dim, final Path vstore, final boolean vstorePresent, final StrataConfig config, final String reason) {
++        if (!vstorePresent) {
++            return;
++        }
++        if (config.forceAnvil) {
++            LOGGER.warn("[strata] *** vstore present at {} but Strata is not active ({}) — booting on Anvil because strata.force-anvil=true; VSTORE DATA IS INVISIBLE until Strata is re-enabled or the vstore is converted back", vstore, reason);
++            return;
++        }
++        throw new IllegalStateException("[strata] refusing to start level " + dim + ": a Strata vstore exists at " + vstore
++            + " but Strata is not active (" + reason + "), so its chunk data would be invisible. "
++            + "Either set strata.enabled=true in strata.properties (and repair the native library if it failed to load), "
++            + "or set strata.force-anvil=true to boot on Anvil anyway, accepting that vstore data stays invisible.");
++    }
++
 +    /** Returns the open store for the dimension directory {@code dimDir}, or {@code null}. */
 +    public static StrataWorld get(final Path dimDir) {
-+        return REGISTRY.get(dimDir.toAbsolutePath().normalize());
++        return REGISTRY.get(registryKey(dimDir));
 +    }
 +
 +    /**
@@ -1526,11 +1666,11 @@ index 0000000..3615c1b
 +     * validity rules as the strata-cli:
 +     *
 +     * <ol>
-+     *   <li>{@code worldRoot} itself (the overworld);</li>
-+     *   <li>{@code worldRoot/DIM-1} and {@code worldRoot/DIM1} (vanilla
-+     *       layout);</li>
-+     *   <li>each {@code worldRoot/dimensions/minecraft/<name>} subdirectory
-+     *       (Canvas/Paper layout).</li>
++     * <li>{@code worldRoot} itself (the overworld);</li>
++     * <li>{@code worldRoot/DIM-1} and {@code worldRoot/DIM1} (vanilla
++     *     layout);</li>
++     * <li>each {@code worldRoot/dimensions/minecraft/<name>} subdirectory
++     *     (Canvas/Paper layout).</li>
 +     * </ol>
 +     *
 +     * A directory counts as a dimension root when it holds at least one of
@@ -1640,33 +1780,40 @@ index 0000000..3615c1b
 +    }
 +
 +    /**
-+     * Reads one record. Store/transport errors are logged and reported as
-+     * {@link ReadState#MISS} so callers fall back to Anvil instead of serving
-+     * corrupted data. An empty payload is the deletion marker.
++     * Reads one record. An empty payload is the deletion marker.
++     *
++     * <p>Store errors and corrupt records are thrown as {@link IOException}
++     * instead of being reported as {@link ReadState#MISS}: the Anvil copy of
++     * a vstore-managed chunk has been deleted, so silently "falling back"
++     * would serve stale or no data. The chunk load must fail loudly and be
++     * retried/reported by the caller.
 +     */
-+    public ReadOutcome read(final int x, final int z, final int typeId) {
-+        final long handle = this.handle;
-+        if (handle == 0L) {
-+            return ReadOutcome.miss();
-+        }
-+        final byte[] payload;
++    public ReadOutcome read(final int x, final int z, final int typeId) throws IOException {
++        this.opLock.readLock().lock();
 +        try {
-+            payload = StrataNative.read(handle, x, z, typeId);
-+        } catch (final StrataException e) {
-+            LOGGER.error("[strata] read failed at ({}, {}) type {}: {}", x, z, typeId, e.getMessage());
-+            return ReadOutcome.miss();
-+        }
-+        if (payload == null) {
-+            return ReadOutcome.miss();
-+        }
-+        if (payload.length == 0) {
-+            return ReadOutcome.deleted();
-+        }
-+        try {
-+            return ReadOutcome.hit(NbtIo.readCompressed(new ByteArrayInputStream(payload), NbtAccounter.unlimitedHeap()));
-+        } catch (final IOException e) {
-+            LOGGER.error("[strata] corrupt record at ({}, {}) type {}: {}", x, z, typeId, e.getMessage());
-+            return ReadOutcome.miss();
++            final long handle = this.handle;
++            if (handle == 0L) {
++                return ReadOutcome.miss();
++            }
++            final byte[] payload;
++            try {
++                payload = StrataNative.read(handle, x, z, typeId);
++            } catch (final StrataException e) {
++                throw new IOException("[strata] vstore read failed at (" + x + ", " + z + ") type " + typeId + ": " + e.getMessage(), e);
++            }
++            if (payload == null) {
++                return ReadOutcome.miss();
++            }
++            if (payload.length == 0) {
++                return ReadOutcome.deleted();
++            }
++            try {
++                return ReadOutcome.hit(NbtIo.readCompressed(new ByteArrayInputStream(payload), NbtAccounter.unlimitedHeap()));
++            } catch (final IOException e) {
++                throw new IOException("[strata] corrupt vstore record at (" + x + ", " + z + ") type " + typeId + ": " + e.getMessage(), e);
++            }
++        } finally {
++            this.opLock.readLock().unlock();
 +        }
 +    }
 +
@@ -1676,23 +1823,28 @@ index 0000000..3615c1b
 +     * the write failed and the caller must keep the Anvil path.
 +     */
 +    public boolean write(final int x, final int z, final int typeId, final CompoundTag compound) {
-+        final long handle = this.handle;
-+        if (handle == 0L) {
-+            return false;
-+        }
++        this.opLock.readLock().lock();
 +        try {
-+            // null compound == deletion marker -> empty payload in the vstore
-+            final byte[] payload = compound == null ? null : serialize(compound);
-+            final int rc = StrataNative.write(handle, x, z, typeId, payload);
-+            if (rc != 0) {
-+                LOGGER.error("[strata] write failed at ({}, {}) type {}: {} (rc={})",
-+                    x, z, typeId, StrataNative.lastError(), rc);
++            final long handle = this.handle;
++            if (handle == 0L) {
 +                return false;
 +            }
-+            return true;
-+        } catch (final StrataException e) {
-+            LOGGER.error("[strata] write failed at ({}, {}) type {}: {}", x, z, typeId, e.getMessage());
-+            return false;
++            try {
++                // null compound == deletion marker -> empty payload in the vstore
++                final byte[] payload = compound == null ? null : serialize(compound);
++                final int rc = StrataNative.write(handle, x, z, typeId, payload);
++                if (rc != 0) {
++                    LOGGER.error("[strata] write failed at ({}, {}) type {}: {} (rc={})",
++                        x, z, typeId, StrataNative.lastError(), rc);
++                    return false;
++                }
++                return true;
++            } catch (final StrataException e) {
++                LOGGER.error("[strata] write failed at ({}, {}) type {}: {}", x, z, typeId, e.getMessage());
++                return false;
++            }
++        } finally {
++            this.opLock.readLock().unlock();
 +        }
 +    }
 +
@@ -1707,45 +1859,115 @@ index 0000000..3615c1b
 +    }
 +
 +    public void flush() {
-+        final long handle = this.handle;
-+        if (handle == 0L) {
++        this.opLock.readLock().lock();
++        try {
++            final long handle = this.handle;
++            if (handle == 0L) {
++                return;
++            }
++            try {
++                StrataNative.flush(handle);
++                this.successfulFlushes.incrementAndGet();
++            } catch (final StrataException e) {
++                LOGGER.error("[strata] flush failed for {}: {}", this.vstore, e.getMessage());
++            }
++        } finally {
++            this.opLock.readLock().unlock();
++        }
++    }
++
++    /**
++     * Schedules online maintenance: every {@code strata.tiering.stable-flushes}
++     * successful flushes since the last pass, runs one GC + tiering cycle
++     * ({@link #maintenanceTick()}). Called by the save-all hook after
++     * {@link #flush()}; startup never scans.
++     */
++    public void maybeRunMaintenance() {
++        final int threshold = this.config.tieringStableFlushes;
++        if (threshold <= 0 || this.successfulFlushes.get() < threshold) {
 +            return;
 +        }
++        this.successfulFlushes.addAndGet(-threshold);
++        this.maintenanceTick();
++    }
++
++    /**
++     * One online maintenance pass: GC (config threshold/budget/min-hole) +
++     * flush + tiering (config stable-flushes/demote-ratio). Failures are
++     * logged, never thrown — maintenance must not break the save path.
++     */
++    public void maintenanceTick() {
++        this.opLock.readLock().lock();
 +        try {
-+            StrataNative.flush(handle);
-+        } catch (final StrataException e) {
-+            LOGGER.error("[strata] flush failed for {}: {}", this.vstore, e.getMessage());
++            final long handle = this.handle;
++            if (handle == 0L) {
++                return;
++            }
++            if (this.config.gcEnabled) {
++                try {
++                    StrataNative.gc(handle, this.config.gcInvalidThreshold, this.config.gcBudgetBytes, this.config.gcMinHoleBytes);
++                } catch (final StrataException e) {
++                    LOGGER.warn("[strata] scheduled gc failed for {}: {}", this.vstore, e.getMessage());
++                }
++            }
++            try {
++                StrataNative.flush(handle);
++            } catch (final StrataException e) {
++                LOGGER.warn("[strata] post-gc flush failed for {}: {}", this.vstore, e.getMessage());
++            }
++            if (this.config.tieringEnabled) {
++                try {
++                    StrataNative.tier(handle, true, this.config.tieringStableFlushes, this.config.tieringDemoteRatio);
++                } catch (final StrataException e) {
++                    LOGGER.warn("[strata] scheduled tiering failed for {}: {}", this.vstore, e.getMessage());
++                }
++            }
++        } finally {
++            this.opLock.readLock().unlock();
 +        }
 +    }
 +
 +    /** Best-effort GC + flush for the /strata command. */
 +    public String gcAndFlush() {
-+        final StringBuilder sb = new StringBuilder();
-+        if (this.config.gcEnabled) {
-+            try {
-+                final long freed = StrataNative.gc(this.handle, this.config.gcInvalidThreshold,
-+                    this.config.gcBudgetBytes, this.config.gcMinHoleBytes);
-+                sb.append("gc freed ").append(freed).append(" bytes");
-+            } catch (final StrataException e) {
-+                sb.append("gc error: ").append(e.getMessage());
-+            }
-+        } else {
-+            sb.append("gc disabled");
-+        }
++        this.opLock.readLock().lock();
 +        try {
-+            StrataNative.flush(this.handle);
-+            sb.append(", flushed");
-+        } catch (final StrataException e) {
-+            sb.append(", flush error: ").append(e.getMessage());
++            final long handle = this.handle;
++            if (handle == 0L) {
++                return "store closed";
++            }
++            final StringBuilder sb = new StringBuilder();
++            if (this.config.gcEnabled) {
++                try {
++                    StrataNative.gc(handle, this.config.gcInvalidThreshold, this.config.gcBudgetBytes, this.config.gcMinHoleBytes);
++                    sb.append("gc ok");
++                } catch (final StrataException e) {
++                    sb.append("gc error: ").append(e.getMessage());
++                }
++            } else {
++                sb.append("gc disabled");
++            }
++            try {
++                StrataNative.flush(handle);
++                sb.append(", flushed");
++            } catch (final StrataException e) {
++                sb.append(", flush error: ").append(e.getMessage());
++            }
++            return sb.toString();
++        } finally {
++            this.opLock.readLock().unlock();
 +        }
-+        return sb.toString();
 +    }
 +
 +    public void close() {
 +        final long handle;
-+        synchronized (this) {
++        this.opLock.writeLock().lock();
++        try {
++            // the write lock only grants after every in-flight reader has
++            // drained; zeroing the handle keeps new operations off the native side
 +            handle = this.handle;
 +            this.handle = 0L;
++        } finally {
++            this.opLock.writeLock().unlock();
 +        }
 +        REGISTRY.values().remove(this);
 +        if (handle != 0L) {
@@ -1766,14 +1988,15 @@ index 0000000..3615c1b
 +}
 diff --git a/canvas-server/src/main/java/io/canvasmc/canvas/subcommands/StrataSubCommand.java b/canvas-server/src/main/java/io/canvasmc/canvas/subcommands/StrataSubCommand.java
 new file mode 100644
-index 0000000..55ec112
+index 0000000..a80f978
 --- /dev/null
 +++ b/canvas-server/src/main/java/io/canvasmc/canvas/subcommands/StrataSubCommand.java
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,163 @@
 +package io.canvasmc.canvas.subcommands;
 +
 +import com.mojang.brigadier.Command;
 +import com.mojang.brigadier.builder.LiteralArgumentBuilder;
++import dev.strata.bridge.StrataException;
 +import io.canvasmc.canvas.commands.SubCommand;
 +import io.canvasmc.canvas.strata.StrataConfig;
 +import io.canvasmc.canvas.strata.StrataConverter;
@@ -1820,9 +2043,13 @@ index 0000000..55ec112
 +            .then(Commands.literal("flush")
 +                .executes(source -> flush(source.getSource())))
 +            .then(Commands.literal("convert-to-strata")
-+                .executes(source -> convert(source.getSource(), true)))
++                .executes(source -> convert(source.getSource(), true, false))
++                .then(Commands.literal("-f").executes(source -> convert(source.getSource(), true, true)))
++                .then(Commands.literal("--force").executes(source -> convert(source.getSource(), true, true))))
 +            .then(Commands.literal("convert-to-anvil")
-+                .executes(source -> convert(source.getSource(), false)));
++                .executes(source -> convert(source.getSource(), false, false))
++                .then(Commands.literal("-f").executes(source -> convert(source.getSource(), false, true)))
++                .then(Commands.literal("--force").executes(source -> convert(source.getSource(), false, true))));
 +    }
 +
 +    private static int version(final CommandSourceStack source) {
@@ -1866,7 +2093,7 @@ index 0000000..55ec112
 +        return Command.SINGLE_SUCCESS;
 +    }
 +
-+    private static int convert(final CommandSourceStack source, final boolean toStrata) {
++    private static int convert(final CommandSourceStack source, final boolean toStrata, final boolean force) {
 +        final MinecraftServer server = source.getServer();
 +        for (final ServerLevel level : server.getAllLevels()) {
 +            if (level.canvas$strataWorld() != null) {
@@ -1889,8 +2116,8 @@ index 0000000..55ec112
 +        }
 +        try {
 +            final StrataConverter.Report report = toStrata
-+                ? StrataConverter.convertToStrata(worldDir, config)
-+                : StrataConverter.convertToAnvil(worldDir, config);
++                ? StrataConverter.convertToStrata(worldDir, config, force)
++                : StrataConverter.convertToAnvil(worldDir, config, force);
 +            if (toStrata) {
 +                source.sendSuccess(() -> Component.literal(
 +                    "Converted " + report.regions() + " regions (" + report.records() + " records) to " + worldDir.resolve("vstore")), false);
@@ -1902,11 +2129,12 @@ index 0000000..55ec112
 +                }
 +            } else {
 +                source.sendSuccess(() -> Component.literal(
-+                    "Converted " + report.regions() + " regions (" + report.records() + " records) back to Anvil"), false);
++                    "Converted " + report.regions() + " regions (" + report.records() + " records) back to Anvil"
++                        + (report.legacyRaw() > 0 ? " (" + report.legacyRaw() + " legacy raw records)" : "")), false);
 +                source.sendSuccess(() -> Component.literal(
 +                    "vstore retained at " + worldDir.resolve("vstore") + " - verify, then delete it manually."), false);
 +            }
-+        } catch (final IOException ex) {
++        } catch (final IOException | StrataException ex) {
 +            StrataWorld.LOGGER.error("Strata conversion failed", ex);
 +            source.sendFailure(Component.literal("Conversion failed: " + ex.getMessage()));
 +        }

@@ -1,13 +1,13 @@
 # Strata Storage — Canvas Integration Patch
 
-Status: **complete and build-verified** (applyAllPatches + compileJava + createPaperclipJar all green on CNB, JDK 25, weaver-patcher 2.4.5, MC 26.2). Round 3: multi-world/multi-dimension extension (per-level vstore at `<dimDir>/vstore`, shared config at world root); 9-parameter `StrataNative.open` with `compressionThreads`.
+Status: **complete and build-verified** (applyAllPatches + compileJava + createPaperclipJar all green on CNB, JDK 25, weaver-patcher 2.4.5, MC 26.2). Round 4: adversarial-audit remediation of all Java support files + patches (strata repo fe72867): `--strataForce` guard, fail-closed startup, online maintenance, read-error escalation.
 
 ## Contents
 
 minecraft-patches/features/0004-Strata-Storage.patch   weaver feature patch (6 files; multi-world ServerLevel hook)
-paper-patches/features/0001-Strata-Storage.patch       weaver feature patch (CraftBukkit Main flags, unchanged)
+paper-patches/features/0001-Strata-Storage.patch       weaver feature patch (CraftBukkit Main flags incl. --strataForce)
 GlobalConfiguration.diff                                /strata command registration (main repo)
-fork-commit-multiworld.patch                            git format-patch of the full fork commit 3812aae (push blocked: no GitHub creds on CNB; apply with git am)
+fork-commit-audit-final.patch                           git format-patch of the full fork commit 087b2f3 (push blocked: no GitHub creds on CNB; apply with git am)
 canvas-server/src/main/java/                            plain sources for the main canvas repo:
   dev/strata/bridge/StrataNative.java                   vendored JNI bridge
   dev/strata/bridge/StrataException.java
@@ -132,6 +132,24 @@ at runtime exist only in the vstore and are not enumerated by the Anvil key
 manifest — for a lossless full export use `strata-cli convert --to-anvil`.
 
 ## Build evidence (CNB, 2026-08-04/05)
+
+Round 4 (audit remediation, strata fe72867):
+
+```
+applyAllPatches (from scratch, new audit hunks): BUILD SUCCESSFUL in 38s (APPLY_RC=0)
+:canvas-server:compileJava:  BUILD SUCCESSFUL in 32s (COMPILE_RC=0) after 2 audit-patch fixes:
+  - ServerLevel fail-closed message: dimension.location() -> dimension.identifier()
+    (ResourceKey has no location() accessor in this codebase)
+  - StrataConverter: blank-final `final byte[] nbt` assigned in try/catch
+    -> javac definite-assignment violation; dropped the `final` (semantics unchanged)
+:canvas-server:createPaperclipJar: BUILD SUCCESSFUL in 50s (JAR_RC=0)
+  -> /root/canvas/canvas-server/build/libs/canvas-paperclip-26.2.local-SNAPSHOT.jar
+weaver rebuild: 0004 content vs audit reference = exactly the identifier() fix (1 line);
+                0001 content byte-identical to audit reference (index-hash-only deltas otherwise)
+```
+
+Fork commit `087b2f392e0593b2d656a90242779583a2ddd8aa` on CNB /root/canvas main
+(10 files, Strata-only). Shipped as `fork-commit-audit-final.patch`.
 
 Round 3 (multi-world/dimension extension, strata 7564046):
 

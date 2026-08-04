@@ -150,7 +150,7 @@ index bd0d782852f9cfe5bc0b5339ecf4d82c10332ec9..295fd544a418930fdb5ab360247fdea3
      }
  
 diff --git a/net/minecraft/server/Main.java b/net/minecraft/server/Main.java
-index c53ced7b540ffeeadae3afd2304d2af77ddd8baa..2b3ab6e1b2cc35157ee922c53fc7875e2992b19c 100644
+index c53ced7b540ffeeadae3afd2304d2af77ddd8baa..0fca57ac0c1d13e82cb0f26d1b91b983a229ed80 100644
 --- a/net/minecraft/server/Main.java
 +++ b/net/minecraft/server/Main.java
 @@ -225,6 +225,19 @@ public class Main {
@@ -174,7 +174,7 @@ index c53ced7b540ffeeadae3afd2304d2af77ddd8baa..2b3ab6e1b2cc35157ee922c53fc7875e
              if (safeModeEnabled) {
                  LOGGER.warn("Safe mode active, only vanilla datapack will be loaded");
 diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
-index 3ea53abdbf0a089fdce5a650acac93dbd5c02410..5c913eec7cc89109b987df7f1faffc382a3eaf60 100644
+index 3ea53abdbf0a089fdce5a650acac93dbd5c02410..7a922bc0b3ec64ce23ae2e21bfe2c6dca41e9722 100644
 --- a/net/minecraft/server/MinecraftServer.java
 +++ b/net/minecraft/server/MinecraftServer.java
 @@ -974,6 +974,12 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
@@ -199,7 +199,7 @@ index 3ea53abdbf0a089fdce5a650acac93dbd5c02410..5c913eec7cc89109b987df7f1faffc38
              this.storageSource.close();
          } catch (IOException e) {
 diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
-index d5775f7367f380c0f69471cbd694aeef681d2da7..0936ed84ea82a2f9cd2d91ad481baf3ab2ac0379 100644
+index d5775f7367f380c0f69471cbd694aeef681d2da7..754751819dea73446ccb859dd13bfc0f20af5c0e 100644
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
 @@ -329,6 +329,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
@@ -241,7 +241,7 @@ index d5775f7367f380c0f69471cbd694aeef681d2da7..0936ed84ea82a2f9cd2d91ad481baf3a
 +                canvas$strataWorldInit = io.canvasmc.canvas.strata.StrataWorld.openFor(canvas$strataConfigRoot, canvas$strataDimDir, dimension == net.minecraft.world.level.Level.OVERWORLD);
 +            } catch (final IllegalStateException ex) {
 +                // fail-closed: vstore present but Strata not active - never boot on stale Anvil silently
-+                throw new IllegalStateException("[Strata] cannot start level " + dimension.location() + ": " + ex.getMessage(), ex);
++                throw new IllegalStateException("[Strata] cannot start level " + dimension.identifier() + ": " + ex.getMessage(), ex);
 +            }
 +        }
 +        this.canvas$strataWorld = canvas$strataWorldInit;

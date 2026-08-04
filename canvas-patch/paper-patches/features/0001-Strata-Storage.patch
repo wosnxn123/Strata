@@ -5,7 +5,7 @@ Subject: [PATCH] Strata Storage
 
 
 diff --git a/src/main/java/org/bukkit/craftbukkit/Main.java b/src/main/java/org/bukkit/craftbukkit/Main.java
-index 8ce8de8eedfe8557848b0508857744a5b9641239..d4092fb106bdb12b27b49f5e5be382a213874e45 100644
+index 8ce8de8eedfe8557848b0508857744a5b9641239..60d6082adfeb5040546c3efd1a486a93123386e8 100644
 --- a/src/main/java/org/bukkit/craftbukkit/Main.java
 +++ b/src/main/java/org/bukkit/craftbukkit/Main.java
 @@ -50,6 +50,12 @@ public class Main {

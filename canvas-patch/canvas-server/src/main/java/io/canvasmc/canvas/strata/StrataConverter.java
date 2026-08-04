@@ -243,7 +243,7 @@ public final class StrataConverter {
                         final int chunkZ = base[1] * 32 + key.localZ();
                         final byte[] payload = StrataNative.read(handle, chunkX, chunkZ, TYPE_IDS[kind]);
                         if (payload != null && payload.length > 0) {
-                            final byte[] nbt;
+                            byte[] nbt;
                             try {
                                 nbt = decompressGzip(payload);
                             } catch (final IOException gzipError) {
