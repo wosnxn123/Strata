@@ -53,6 +53,23 @@ pub(crate) fn cold_path(root: &Path, region_x: i32, region_z: i32) -> PathBuf {
     root.join(COLD_DIR).join(format!("r.{region_x}.{region_z}.varc"))
 }
 
+/// Windows 上新建/刚写过的文件可能被杀软或索引器短暂锁定：删除遇到
+/// `PermissionDenied` 时 sleep 50ms 重试（共 3 次），与 strata-cli 同策略。
+pub(crate) fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for _ in 0..3 {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("retry exhausted")))
+}
+
 /// Store 配置。
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
@@ -597,14 +614,20 @@ impl Store {
     }
 
     /// 删除一个段：数据文件 + 索引页 + 内存状态 + 段表 + 缓存。
+    ///
+    /// 文件删除带重试：Windows 上杀软/索引器可能短暂锁定文件。
     pub(crate) fn remove_segment(&mut self, seg_id: u32) -> Result<(), StrataError> {
         let p = seg_path(&self.root, seg_id);
         if p.exists() {
-            std::fs::remove_file(&p)?;
+            remove_file_with_retry(&p).map_err(|e| {
+                StrataError::Manifest(format!("删除段文件 `{}` 失败: {e}", p.display()))
+            })?;
         }
         let ix = ix_path(&self.root, seg_id);
         if ix.exists() {
-            std::fs::remove_file(&ix)?;
+            remove_file_with_retry(&ix).map_err(|e| {
+                StrataError::Manifest(format!("删除段索引 `{}` 失败: {e}", ix.display()))
+            })?;
         }
         self.segs.remove(&seg_id);
         self.manifest.segments.retain(|m| m.id != seg_id);

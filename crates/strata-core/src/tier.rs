@@ -12,13 +12,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::path::Path;
 
 use crate::cold::{ArchiveBuilder, ArchiveReader};
 use crate::envelope::Envelope;
 use crate::index::{IndexKey, IndexPage, IndexVal, RegionBitmap};
 use crate::manifest::{ColdMeta, RegionKey};
 use crate::segment::scan_segment;
-use crate::store::{cold_path, ix_path, seg_path, Store, COLD_DIR};
+use crate::store::{cold_path, ix_path, remove_file_with_retry, seg_path, Store, COLD_DIR};
 use crate::StrataError;
 
 /// 分层迁移配置。
@@ -53,6 +54,23 @@ pub struct TierStats {
     pub bytes_cold: u64,
 }
 
+/// 给已是 `StrataError` 的结果附加“操作名 + 路径”上下文。
+///
+/// Windows 上裸 `Os { code: 5, "Access is denied" }` 不带任何线索，
+/// tier 路径全部 IO 出口统一经此包装，CI 报错可直接定位步骤与文件。
+fn ctx<T>(res: Result<T, StrataError>, op: &str, path: &Path) -> Result<T, StrataError> {
+    res.map_err(|e| {
+        StrataError::Manifest(format!("tier: {op} `{}` 失败: {e}", path.display()))
+    })
+}
+
+/// 同 [`ctx`]，用于原始 `io::Result`。
+fn ctx_io<T>(res: std::io::Result<T>, op: &str, path: &Path) -> Result<T, StrataError> {
+    res.map_err(|e| {
+        StrataError::Manifest(format!("tier: {op} `{}` 失败: {e}", path.display()))
+    })
+}
+
 impl Store {
     /// 热↔冷迁移一趟：降级在前（回热后当轮即有资格再晋升），晋升在后。
     ///
@@ -65,8 +83,9 @@ impl Store {
         }
 
         if let Some(mut w) = self.writer.take() {
-            w.fsync()?;
-            w.close()?;
+            let sp = seg_path(&self.root, self.active_seg);
+            ctx(w.fsync(), "关闭活跃段前 fsync", &sp)?;
+            ctx(w.close(), "关闭活跃段写入器", &sp)?;
         }
 
         self.demote_pass(cfg, &mut stats)?;
@@ -101,13 +120,15 @@ impl Store {
             // 只搬回未被失效的槽位：失效槽位已被更新的热写覆盖，
             // 以新 gen 写回旧值会让用户写入被静默回滚。
             let entries = {
-                let mut reader = ArchiveReader::open(&path)?;
+                let mut reader = ctx(ArchiveReader::open(&path), "打开冷归档", &path)?;
                 let mut keep = Vec::new();
-                for (env, nbt) in reader.extract_all()? {
-                    if reader
-                        .get(env.chunk_x, env.chunk_z, env.type_id)?
-                        .is_some()
-                    {
+                for (env, nbt) in ctx(reader.extract_all(), "解包冷归档", &path)? {
+                    let visible = ctx(
+                        reader.get(env.chunk_x, env.chunk_z, env.type_id),
+                        "复核冷归档槽位",
+                        &path,
+                    )?;
+                    if visible.is_some() {
                         keep.push((env, nbt));
                     }
                 }
@@ -125,20 +146,28 @@ impl Store {
             });
 
             for (env, nbt) in entries {
-                self.write(env.chunk_x, env.chunk_z, env.type_id, &nbt)?;
+                self.write(env.chunk_x, env.chunk_z, env.type_id, &nbt)
+                    .map_err(|e| {
+                        StrataError::Manifest(format!(
+                            "tier: 降级回写 ({}, {}, type={}) 至热层失败: {e}",
+                            env.chunk_x, env.chunk_z, env.type_id
+                        ))
+                    })?;
             }
 
+            // Windows 上杀软/索引器可能短暂锁定文件：删除带重试
+            // （此时本地与缓存的读取器均已 drop，无打开句柄）。
             if path.exists() {
-                std::fs::remove_file(&path)?;
+                ctx_io(remove_file_with_retry(&path), "删除冷归档", &path)?;
             }
             let inv = path.with_extension("varc.inv");
             if inv.exists() {
-                std::fs::remove_file(inv)?;
+                ctx_io(remove_file_with_retry(&inv), "删除冷归档失效位图", &inv)?;
             }
             stats.demoted += 1;
         }
 
-        self.manifest.save(&self.root)?;
+        ctx(self.manifest.save(&self.root), "保存 manifest（降级收尾）", &self.root)?;
         Ok(())
     }
 
@@ -146,7 +175,7 @@ impl Store {
     fn promote_pass(&mut self, cfg: &TierConfig, stats: &mut TierStats) -> Result<(), StrataError> {
         // 1. 全局最新视图判死活（同 gc），段按 id 升序扫描收集每 region
         //    的存活记录（键 + 原始信封）与最大 epoch_ts。
-        let latest = self.latest_index()?;
+        let latest = ctx(self.latest_index(), "构建最新索引视图", &self.root)?;
         let mut ids: Vec<u32> = self.manifest.segments.iter().map(|m| m.id).collect();
         ids.sort_unstable();
 
@@ -215,7 +244,13 @@ impl Store {
             let mut ok = true;
             for k in &keys {
                 let (_, env) = &live[k];
-                match self.read(k.x, k.z, k.type_id)? {
+                let nbt = self.read(k.x, k.z, k.type_id).map_err(|e| {
+                    StrataError::Manifest(format!(
+                        "tier: 晋升前读键 ({}, {}, type={}) 失败: {e}",
+                        k.x, k.z, k.type_id
+                    ))
+                })?;
+                match nbt {
                     Some(nbt) => {
                         builder.add(env.clone(), nbt);
                         entries += 1;
@@ -231,10 +266,26 @@ impl Store {
             }
 
             // 4. 落盘 + fsync。
-            std::fs::create_dir_all(self.root.join(COLD_DIR))?;
+            let cold_dir = self.root.join(COLD_DIR);
+            std::fs::create_dir_all(&cold_dir).map_err(|e| {
+                StrataError::Manifest(format!(
+                    "tier: 创建冷目录 `{}` 失败: {e}",
+                    cold_dir.display()
+                ))
+            })?;
             let path = cold_path(&self.root, rk.0, rk.1);
-            builder.finish(&path)?;
-            File::open(&path)?.sync_all()?;
+            ctx(builder.finish(&path), "写冷归档", &path)?;
+            // 根因修复：Windows 的 FlushFileBuffers 要求 GENERIC_WRITE，
+            // 只读句柄 sync_all 得 ERROR_ACCESS_DENIED (os error 5)；
+            // Unix fsync 对 O_RDONLY 无此限制，故仅 Windows 失败。
+            ctx_io(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|f| f.sync_all()),
+                "fsync 冷归档",
+                &path,
+            )?;
 
             // 5. 注册冷区并从热层移除全部键。
             self.manifest.cold.push(ColdMeta {
@@ -247,7 +298,7 @@ impl Store {
             stats.promoted += 1;
         }
 
-        self.manifest.save(&self.root)?;
+        ctx(self.manifest.save(&self.root), "保存 manifest（晋升收尾）", &self.root)?;
         Ok(())
     }
 
@@ -263,9 +314,12 @@ impl Store {
         // 受影响段 = 磁盘页或增量中含该 region 条目者。
         let mut touched: Vec<u32> = Vec::new();
         for (&seg_id, st) in &self.segs {
-            let page_has = self
-                .load_page(seg_id)?
-                .is_some_and(|p| p.iter().any(|(k, _)| in_region(k)));
+            let page_has = ctx(
+                self.load_page(seg_id),
+                "读段索引页（判定受影响段）",
+                &ix_path(&self.root, seg_id),
+            )?
+            .is_some_and(|p| p.iter().any(|(k, _)| in_region(k)));
             let inc_has = st.incremental.iter().any(|(k, _)| in_region(k));
             if page_has || inc_has {
                 touched.push(seg_id);
@@ -274,7 +328,11 @@ impl Store {
 
         for seg_id in touched {
             // 重建磁盘页：过滤掉 region 条目后原子替换（tmp + fsync + rename）。
-            let kept: Vec<(IndexKey, IndexVal)> = match self.load_page(seg_id)? {
+            let kept: Vec<(IndexKey, IndexVal)> = match ctx(
+                self.load_page(seg_id),
+                "读段索引页（重建）",
+                &ix_path(&self.root, seg_id),
+            )? {
                 Some(page) => page
                     .iter()
                     .filter(|(k, _)| !key_set.contains(k))
@@ -288,14 +346,15 @@ impl Store {
             let tmp_path = final_path.with_extension("vix.tmp");
             {
                 use std::io::Write;
-                let mut f = File::create(&tmp_path)?;
-                f.write_all(&bytes)?;
-                f.sync_all()?;
+                let mut f = ctx_io(File::create(&tmp_path), "创建临时索引页", &tmp_path)?;
+                ctx_io(f.write_all(&bytes), "写临时索引页", &tmp_path)?;
+                ctx_io(f.sync_all(), "fsync 临时索引页", &tmp_path)?;
             }
+            // Windows 删除带重试（此时 .vix 无打开句柄：页只存在于内存缓存）。
             if final_path.exists() {
-                std::fs::remove_file(&final_path)?;
+                ctx_io(remove_file_with_retry(&final_path), "删除旧索引页", &final_path)?;
             }
-            std::fs::rename(&tmp_path, &final_path)?;
+            ctx_io(std::fs::rename(&tmp_path, &final_path), "重命名临时索引页", &final_path)?;
 
             // 增量同样过滤；位图无单槽清除，按新页 ∪ 新增量整体重建。
             if let Some(st) = self.segs.get_mut(&seg_id) {
