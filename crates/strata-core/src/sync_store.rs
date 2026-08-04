@@ -126,12 +126,9 @@ mod tests {
                 let mut hits = 0u64;
                 for _ in 0..2_000 {
                     let x = (t * 2) * 10_000 + (hits % 500) as i32;
-                    match s.read(x, t * 2, 0).unwrap() {
-                        Some(v) => {
-                            assert_eq!(v.len(), 3);
-                            hits += 1;
-                        }
-                        None => {}
+                    if let Some(v) = s.read(x, t * 2, 0).unwrap() {
+                        assert_eq!(v.len(), 3);
+                        hits += 1;
                     }
                 }
                 hits

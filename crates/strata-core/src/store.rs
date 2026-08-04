@@ -191,20 +191,6 @@ impl std::hash::Hash for RegionKey {
 /// `&mut self` 调用边界，因此跨线程不存在别名可变性。
 unsafe impl Sync for Store {}
 
-#[cfg(test)]
-mod sync_traits_tests {
-    use super::Store;
-
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-
-    #[test]
-    fn store_is_send_and_sync() {
-        assert_send::<Store>();
-        assert_sync::<Store>();
-    }
-}
-
 impl Store {
     /// 打开（或创建）`root` 处的 vstore。
     ///
@@ -821,5 +807,19 @@ impl Store {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sync_traits_tests {
+    use super::Store;
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    #[test]
+    fn store_is_send_and_sync() {
+        assert_send::<Store>();
+        assert_sync::<Store>();
     }
 }

@@ -36,7 +36,7 @@ const PANIC: i32 = 2;
 const MISSING: i32 = 3;
 
 thread_local! {
-    static LAST_ERROR: RefCell<String> = RefCell::new(String::new());
+    static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 fn set_last_error(msg: impl AsRef<str>) {
@@ -396,7 +396,7 @@ mod tests {
 
         // write ×3
         for i in 0..3i32 {
-            let payload = vec![i as u8; 32];
+            let payload = [i as u8; 32];
             let code = strata_write(h, i, -i, i as u16, payload.as_ptr(), payload.len());
             assert_eq!(code, OK);
         }
