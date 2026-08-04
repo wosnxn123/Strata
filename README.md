@@ -1,7 +1,7 @@
 # Strata
 
 [![CI](https://github.com/wosnxn123/Strata/actions/workflows/ci.yml/badge.svg)](https://github.com/wosnxn123/Strata/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org/)
 
 **Strata** —— Minecraft 服务端（Paper/Folia/Canvas 系）的 Rust 混合双层存储引擎：**段日志热层 + 分块固态冷归档**，体积 ↓45%、内存与世界大小无关、逐条 xxhash 自愈。
@@ -188,7 +188,7 @@ strata.gc.budget-bytes=33554432
 
 ---
 
-## 📄 License
+## 📄 License / 许可证
 
-本项目基于 [MIT License](./LICENSE) 开源。Copyright (c) 2026 Snowflake (wosnxn123).
-Licensed under the [MIT License](./LICENSE).
+本项目基于 [GNU GPL-3.0](./LICENSE) 开源。Copyright (C) 2026 Snowflake (wosnxn123).
+Licensed under the [GNU General Public License v3.0](./LICENSE).
