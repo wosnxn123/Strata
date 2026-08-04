@@ -119,7 +119,8 @@ unsafe fn handle(h: *mut c_void) -> Result<&'static SyncStore, String> {
     Ok(&*(h as *const SyncStore))
 }
 
-/// 构造 [`StoreConfig`]（布尔位按 C 约定：非 0 = 启用）。
+/// 构造 [`StoreConfig`]（布尔位按 C 约定：非 0 = 启用；
+/// `compression_threads` 负值按 0 = 自动处理）。
 fn config_from_parts(
     hot_level: i32,
     hot_enabled: i32,
@@ -128,6 +129,7 @@ fn config_from_parts(
     dictionary: i32,
     cache_mb: u64,
     segment_max_bytes: u64,
+    compression_threads: i32,
 ) -> StoreConfig {
     StoreConfig {
         hot_level,
@@ -137,6 +139,7 @@ fn config_from_parts(
         dictionary: dictionary != 0,
         cache_mb,
         segment_max_bytes,
+        compression_threads: compression_threads.max(0) as u32,
     }
 }
 
@@ -152,6 +155,7 @@ pub(crate) fn core_open(
     dictionary: i32,
     cache_mb: u64,
     segment_max_bytes: u64,
+    compression_threads: i32,
 ) -> Result<*mut c_void, String> {
     let cfg = config_from_parts(
         hot_level,
@@ -161,6 +165,7 @@ pub(crate) fn core_open(
         dictionary,
         cache_mb,
         segment_max_bytes,
+        compression_threads,
     );
     let store = SyncStore::open(Path::new(root), cfg).map_err(|e| e.to_string())?;
     Ok(Box::into_raw(Box::new(store)) as *mut c_void)
@@ -212,7 +217,7 @@ pub(crate) fn core_gc(
         budget_bytes,
         min_hole_bytes,
     };
-    store.gc_pass(&cfg).map_err(|e| e.to_string())
+    store.gc_pass(&cfg).map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// 一轮分层迁移：热 → 冷晋升 / 解包降级。
@@ -229,7 +234,7 @@ pub(crate) fn core_tier(
         stable_flushes,
         invalid_demote_ratio,
     };
-    store.tier_pass(&cfg).map_err(|e| e.to_string())
+    store.tier_pass(&cfg).map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// 关闭并释放 store；NULL 为无操作。之后句柄不得再使用。
@@ -254,13 +259,14 @@ pub(crate) fn last_error_message() -> String {
 }
 
 /// 打开（或创建）`root` 处的 vstore；失败返回 NULL（详情 strata_last_error）。
-/// 布尔开关以 i32 传入：非 0 = 启用。
+/// 布尔开关以 i32 传入：非 0 = 启用。`compression_threads`：批量写入的压缩
+/// 线程数，`0` = 自动（全部可用核心），`1` = 串行（默认），`N ≥ 2` = 限 N 线程。
 ///
 /// # Safety
 ///
 /// `root` 必须是 NUL 结尾、读之有效的 UTF-8 C 字符串。
 #[no_mangle]
-// C ABI 签名由外部约定固定为 8 参数，不做 Rust 侧拆分。
+// C ABI 签名由外部约定固定为 9 参数，不做 Rust 侧拆分。
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn strata_open(
     root: *const c_char,
@@ -271,6 +277,7 @@ pub extern "C" fn strata_open(
     dictionary: i32,
     cache_mb: u64,
     segment_max_bytes: u64,
+    compression_threads: i32,
 ) -> *mut c_void {
     guarded_open(move || {
         if root.is_null() {
@@ -290,6 +297,7 @@ pub extern "C" fn strata_open(
             dictionary,
             cache_mb,
             segment_max_bytes,
+            compression_threads,
         )
     })
 }
@@ -492,6 +500,7 @@ mod tests {
             1, // dictionary
             512,
             64 * 1024 * 1024,
+            1, // compression_threads
         );
         assert!(!h.is_null(), "open failed");
         h
@@ -548,7 +557,7 @@ mod tests {
 
     #[test]
     fn open_null_root_reports_error() {
-        let h = strata_open(ptr::null(), 3, 1, 9, 1, 1, 512, 64 * 1024 * 1024);
+        let h = strata_open(ptr::null(), 3, 1, 9, 1, 1, 512, 64 * 1024 * 1024, 1);
         assert!(h.is_null());
         let mut buf = [0u8; 64];
         let n = strata_last_error(buf.as_mut_ptr(), buf.len());
