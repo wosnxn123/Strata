@@ -11,6 +11,7 @@ pub mod punch;
 pub mod segment;
 pub mod store;
 pub mod sync_store;
+pub mod tier;
 
 pub use error::StrataError;
 pub use store::{BatchItem, BatchWriteResult, Store, StoreConfig};
