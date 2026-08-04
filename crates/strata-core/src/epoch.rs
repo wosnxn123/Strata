@@ -63,7 +63,11 @@ impl EpochLog {
     /// truncate would fail with Access denied.
     pub fn open(dir: &Path) -> Result<Self, StrataError> {
         let path = dir.join(EPOCH_LOG_NAME);
-        let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
             w: BufWriter::new(file),
