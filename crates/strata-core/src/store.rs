@@ -341,6 +341,11 @@ impl Store {
         // 10. 冷区失效：覆盖已晋升 region 的键时，归档槽位作废并记账。
         self.invalidate_cold_slot(x, z, type_id)?;
 
+        // 11. 缓冲落盘：保证同会话内 read() 能读到刚写入的记录。
+        if let Some(w) = self.writer.as_mut() {
+            w.flush()?;
+        }
+
         Ok(())
     }
 

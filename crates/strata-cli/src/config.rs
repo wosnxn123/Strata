@@ -73,7 +73,11 @@ impl PartialEq for StrataConfig {
 pub fn load_or_create_template(world_root: &Path) -> Result<StrataConfig, StrataError> {
     let path = world_root.join(CONFIG_FILE);
     if !path.exists() {
-        std::fs::write(&path, TEMPLATE)?;
+        std::fs::write(&path, TEMPLATE).map_err(|e| StrataError::Config {
+            file: CONFIG_FILE.to_string(),
+            line: 0,
+            detail: format!("写入配置模板失败: {e}"),
+        })?;
         return Ok(StrataConfig::default());
     }
     let text = std::fs::read_to_string(&path)?;

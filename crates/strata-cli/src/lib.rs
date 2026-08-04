@@ -217,6 +217,42 @@ fn append_progress(root: &Path, line: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Windows 上新建文件可能被杀软/索引器短暂锁定：删除失败时重试 3 次。
+fn remove_with_retry(path: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for _ in 0..3 {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "retry exhausted")
+    }))
+}
+
+/// Windows 上新写入的文件可能被杀软/索引器短暂锁定：目录删除失败时重试。
+fn remove_dir_with_retry(path: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for _ in 0..5 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "retry exhausted")
+    }))
+}
+
 /// Anvil → Strata：覆盖目标 vstore、保留 Anvil 源。
 fn convert_to_strata(world: &Path) -> anyhow::Result<()> {
     require_overworld(world)?;
@@ -229,10 +265,11 @@ fn convert_to_strata(world: &Path) -> anyhow::Result<()> {
     }
 
     // 2. 覆盖语义：进度文件在 vstore 内 → 先读进度，再整体删除重建。
+    //    Windows 上新写入的文件可能被杀软短暂锁定，remove_dir_all 带重试。
     let mut done = HashSet::new();
     if vstore.exists() {
         done = load_progress(&vstore.join(PROGRESS_FILE));
-        std::fs::remove_dir_all(&vstore)
+        remove_dir_with_retry(&vstore)
             .with_context(|| format!("删除旧 vstore {}", vstore.display()))?;
     }
 
@@ -273,7 +310,9 @@ fn convert_to_strata(world: &Path) -> anyhow::Result<()> {
                 })?;
                 chunks_written += 1;
             }
-            store.flush()?;
+            store
+                .flush()
+                .with_context(|| format!("region {marker} 写入后 flush"))?;
             append_progress(&vstore, &marker)?;
             regions_converted += 1;
         }
@@ -283,7 +322,8 @@ fn convert_to_strata(world: &Path) -> anyhow::Result<()> {
     drop(store);
     let progress = vstore.join(PROGRESS_FILE);
     if progress.exists() {
-        std::fs::remove_file(&progress)?;
+        remove_with_retry(&progress)
+            .with_context(|| format!("删除进度文件 {}", progress.display()))?;
     }
 
     // 6. 汇总。
