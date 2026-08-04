@@ -117,6 +117,12 @@ fn batch_parallel_faster_than_serial() {
         t0.elapsed()
     };
 
+    println!(
+        "parallel_compression: serial={:?} batch={:?} speedup={:.2}x",
+        serial,
+        batch,
+        serial.as_secs_f64() / batch.as_secs_f64().max(f64::EPSILON)
+    );
     assert!(
         batch <= serial,
         "batch {batch:?} slower than serial {serial:?}"
