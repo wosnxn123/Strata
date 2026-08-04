@@ -15,7 +15,7 @@
 //! convention of the rest of the engine.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::envelope::{Envelope, ENVELOPE_SIZE};
@@ -56,10 +56,15 @@ pub struct EpochLog {
 
 impl EpochLog {
     /// Open `dir/current.velog`, creating it if missing, otherwise
-    /// reopening it in append mode.
+    /// reopening it positioned at the end.
+    ///
+    /// Opened in `write` (not `append`) mode: on Windows an append-mode
+    /// handle (`FILE_APPEND_DATA`) cannot `SetEndOfFile`, so `rotate`'s
+    /// truncate would fail with Access denied.
     pub fn open(dir: &Path) -> Result<Self, StrataError> {
         let path = dir.join(EPOCH_LOG_NAME);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
+        file.seek(SeekFrom::End(0))?;
         Ok(Self {
             w: BufWriter::new(file),
             path,
@@ -87,6 +92,7 @@ impl EpochLog {
         let file = self.w.get_mut();
         file.sync_all()?;
         file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
         file.sync_all()?;
         Ok(())
     }
