@@ -91,9 +91,9 @@ graph TB
         FFI --> RECOV
     end
     subgraph TOOLING["工具链"]
-        CLI["strata-cli：Cesium 式转换 / verify / compact / stats"]
+        CLI["strata-cli：convert / verify / compact / stats / recompress"]
     end
-    SHIM -- "JNI 零拷贝 NBT blob" --> FFI
+    SHIM -- "JNI：NBT blob 透传" --> FFI
     CLI --> FFI
 ```
 
@@ -102,9 +102,9 @@ graph TB
 | crate | 职责 |
 |---|---|
 | `strata-core` | 容器格式、段引擎、三层索引、GC、冷归档、恢复——纯 Rust，零 JVM 依赖 |
-| `strata-ffi` | C ABI + JNI 桥，所有跨边界调用 `catch_unwind` 包裹（Phase 2） |
-| `strata-cli` | Cesium 式双向转换器、`verify`、`compact`、`stats`、`strata.properties` 加载器 |
-| `strata-plugin-canvas`（Java） | Canvas/Folia 集成 shim（Phase 2） |
+| `strata-ffi` | C ABI + JNI 符号层（手写 JNI FFI，零依赖），所有跨边界调用 `catch_unwind` 包裹 |
+| `strata-cli` | Cesium 式双向转换器（多维度）、`verify`、`compact`、`stats`、`recompress`、`strata.properties` 加载器 |
+| `java-bridge`（Java，仓内源码） | JNI 绑定 + 启动转换钩子 + `/strata` 命令源码；以 weaver patch 形式集成进 Canvas fork（无独立运行时插件） |
 
 ### 磁盘布局（每 dimension 一个存储池）
 
@@ -265,23 +265,25 @@ Meterstick 证实 MC 负载高波动 → GC 默认按前台写压力自适应节
 世界根目录（与 level.dat 同级），Java properties 格式（`key=value`，`#` 注释）。CLI 与服务端 shim 共用同一加载器。**启动时加载**（不做热重载——存储参数中途切换易生歧义）；缺失文件 → 生成带注释模板 + 全默认。
 
 ```properties
-# 总开关（默认 false——必须显式启用）
+# Strata storage configuration / Strata 存储配置
+# Master switch (default off — opt in) / 总开关（默认关闭，需显式启用）
 strata.enabled=false
-# 冷层（轴 1：容器分层）
+# Cold tier (hot -> cold migration) / 冷层（热→冷迁移）
 strata.tiering.enabled=true
 strata.tiering.stable-flushes=30
 strata.tiering.invalid-demote-ratio=0.25
-# 压缩（轴 2：与轴 1 正交）
+# Compression / 压缩
 strata.compression.hot-enabled=true
 strata.compression.cold-enabled=true
 strata.compression.hot=zstd-3
 strata.compression.cold=zstd-9
 strata.compression.dictionary=true
-# 批量压缩工作线程：0=自动(全核) 1=串行(默认,TPS优先) N≥2=限N线程
+# Batch compression workers: 0=auto(all cores) 1=serial(default, TPS-first) N>=2=capped
+# 批量压缩线程：0=自动(全核) 1=串行(默认,TPS优先) N≥2=限N线程
 strata.compression.threads=1
-# 索引内存上界
+# Index memory budget (MiB) / 索引内存预算（MiB）
 strata.index.cache-mb=512
-# GC
+# GC / 垃圾回收
 strata.gc.enabled=true
 strata.gc.invalid-threshold=0.6
 strata.gc.budget-bytes=33554432
@@ -317,7 +319,7 @@ strata.gc.budget-bytes=33554432
 
 ## 10. 迁移与转换器（Cesium 式行为）
 
-- **触发**：服务端启动参数 `--strataConvertToStrata` / `--strataConvertToAnvil`（Phase 2 shim 解析）；CLI 等价命令 `strata-cli convert --to-strata <world>` / `--to-anvil <world>`。转换在启动前同步执行，完成后继续启动。
+- **触发**：服务端启动参数 `--strataConvertToStrata` / `--strataConvertToAnvil`（Canvas 集成 shim 解析，已实现）；CLI 等价命令 `strata-cli convert --to-strata <world>` / `--to-anvil <world>`。转换在启动前同步执行，完成后继续启动。
 - **原地覆盖**：输出写到同一世界目录目标存储；目标已存在**直接覆盖重建**（与 Cesium wiki 一致）。重复执行同方向转换 = 重新生成；转换后应移除启动参数，否则下次启动再次覆盖。
 - **保留源格式**：转换**绝不删除**源（`region/`/`entities/`/`poi/` 或 `vstore/`），运维验证后**手动删除**；结束时打印醒目提示与源目录列表。
 - **可恢复进度**：每 region 完成追加 `vstore/.convert-progress` 一行 + fsync；中断重跑跳过已完成；全部完成后删除进度文件。
@@ -326,11 +328,11 @@ strata.gc.budget-bytes=33554432
 
 ---
 
-## 11. FFI/JNI 集成与 Folia 兼容（Phase 2，接口约定）
+## 11. FFI/JNI 集成与 Folia 兼容（已实现）
 
-- **零拷贝**：NBT blob 经 DirectByteBuffer 传递，Rust 侧拿 `&[u8]` 直接压缩。
-- **每个跨边界调用 `catch_unwind`**：Rust panic → Java 异常 + 日志，绝不炸 JVM。
-- shim 挂在 Moonrise chunk IO 线程之下（regionizer 下游），不触碰 tick 线程模型；段分片按 regionizer 分区哈希，写入天然无锁。
+- **边界形态**：Java 侧序列化 NBT→`byte[]`，JNI 经 `GetByteArrayElements` 拷入 Rust（一次拷贝；DirectByteBuffer 零拷贝未采纳——chunk 负载压缩本身是重计算，拷贝占比可忽略，换来异常/所有权语义简单）。Rust 永不解析 NBT，payload 全程不透明字节。
+- **每个跨边界调用 `catch_unwind`**：Rust panic → Java `StrataException` + 日志，绝不炸 JVM。
+- shim 挂在 Moonrise `DataController` 字节边界（chunk IO 线程之下、regionizer 下游），不触碰 tick 线程模型；写入经 `SyncStore` 内部互斥串行化追加，索引/缓存走近免锁路径。
 - 已核实：Spottedleaf SectorFile 实验开过 Folia 分支，存储层替换在 Folia 可行。
 - 插件透明：Bukkit/Paper API 无感知；外部 `.mca` 工具不可直读新格式，CLI 双向转换兜底。
 
@@ -343,7 +345,7 @@ strata.gc.budget-bytes=33554432
 - `strata-core` 单元 + property-based fuzz（proptest；信封编解码、段追加/扫描、索引、GC、恢复）。
 - 崩溃注入：随机在写入/fsync/epoch 切换点 kill，验证三级恢复。
 - 基准（criterion）：vs Anvil 体积（目标 ≤0.65×）/写吞吐/读延迟 p50·p99；合成世界 4096 chunk。
-- 集成（Phase 2）：Canvas 实服跑图 + 插件兼容性矩阵（Multiverse 等）。
+- 集成：Canvas 无头实服烟雾**已通过**（三维度 vstore 接管、崩溃恢复、优雅停机、读回）；真实玩家负载浸泡与插件兼容性矩阵（Multiverse 实测）留待部署回归。
 
 ### 风险与缓解
 
@@ -363,6 +365,6 @@ strata.gc.budget-bytes=33554432
 
 - 学习索引（Bourbon/CARMI 完整版）：键空间泛化时再评估
 - per-type 之外的多字典策略 / lzma2 冷层 codec（注册表已留扩展位）
-- `strata-cli recompress <world>` 全量重压维护命令
+- ~~`strata-cli recompress <world>` 全量重压维护命令~~ ✅ 已实现（vstore.new 重写 + 全量哈希校验 + rename 交换，失败不动原 store）
 - ~~Nether/End 维度转换~~ ✅ 已实现（多维度遍历 + 每维度独立 vstore）；多世界（插件创建的世界）同步支持
 - playerdata/stats/advancements/savedata 纳入（Phase 1 仅三大件，信封 type_id 已预留）

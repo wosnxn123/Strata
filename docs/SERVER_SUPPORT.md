@@ -5,10 +5,11 @@ Strata 对 Minecraft 服务端各端的支持状态一览。
 | 服务端 | 状态 | 描述 |
 | --- | --- | --- |
 | strata-core 存储引擎（Rust） | ✅ 已完成 | 段日志热层 + 分块冷归档 + 三层索引 + 三档 GC，CI 双平台全绿（Windows + Linux） |
-| strata-cli 转换器 | ✅ 已完成 | Cesium 式双向转换（覆盖目标、保留源、进度恢复）、verify/compact/stats |
+| strata-cli 转换器 | ✅ 已完成 | Cesium 式双向转换（覆盖目标、保留源、进度恢复、**多维度遍历**）、verify/compact/stats/**recompress** |
 | strata-ffi C ABI | ✅ 已完成 | Rust cdylib/staticlib，catch_unwind 全函数，CI 双平台全绿（Linux + Windows 交叉编译 DLL） |
-| JNI 桥接层 | 🚧 开发中 | `Java_dev_strata_bridge_StrataNative_*` 符号层（手写 JNI FFI，零依赖），供 Java 侧加载 native |
-| Canvas（自魔改 fork） | 🚧 开发中 | **主集成目标**：[wosnxn123/Canvas](https://github.com/wosnxn123/Canvas)。weaver feature patch 已生成并构建验证（applyAllPatches + compileJava + createPaperclipJar 全绿），`/strata` 命令与启动转换钩子就绪 |
+| JNI 桥接层 | ✅ 已完成 | `Java_dev_strata_bridge_StrataNative_*` 符号层（手写 JNI FFI，零依赖）。**Windows 实服烟雾验证通过**：native bridge 加载、**三维度各自路由 vstore**、硬杀崩溃恢复、RCON 优雅停机、二次启动读回全绿 |
+| 多世界 / 多维度 | ✅ 已完成 | 主世界/下界/末地各自独立 `<维度目录>/vstore`；Multiverse 等插件创建的世界各自读自己的 `strata.properties` 自动接管 |
+| Canvas（自魔改 fork） | ✅ 已完成 | **主集成目标**：[wosnxn123/Canvas](https://github.com/wosnxn123/Canvas)。weaver feature patch（`0004-Strata-Storage` + paper `0001`）已合入 fork main 并推送；applyAllPatches + compileJava + createPaperclipJar 全绿，实服烟雾通过；`/strata` 命令、启动转换钩子、压缩线程开关齐备 |
 | Paper / Folia（上游） | 📋 计划中 | 提供**源代码 + 构建嵌入教程**，供自行 patch 嵌入；运行期效果与 Canvas fork 一致 |
 | Fabric / NeoForge 模组 | 📋 计划中 | 远期模组端适配：复用 vanilla IO 适配层，对标 Cesium 形态 |
 | 其他插件端（Spigot/Arclight 等） | 📋 计划中 | 提供**自构建 + 源代码嵌入构建教程**；Arclight 走 vanilla IO 路径（不支持 Folia，与 modloader 互斥） |
@@ -17,10 +18,10 @@ Strata 对 Minecraft 服务端各端的支持状态一览。
 
 ## 集成形态说明
 
-Strata 的存储后端替换**无法**通过纯插件 API 实现（Paper 未公开存储后端替换接口，`RegionFileVersion` 仅能换压缩算法、仍受 Anvil 4KB 容器限制）。因此采用**字节边界 Mixin hook + 内嵌 fork patch** 形态：
+Strata 的存储后端替换**无法**通过纯插件 API 实现（Paper 未公开存储后端替换接口，`RegionFileVersion` 仅能换压缩算法、仍受 Anvil 4KB 容器限制）。因此采用**源码级 patch 内嵌**形态（钩在 Moonrise `DataController` 字节边界 + `ServerLevel` per-level store 解析）：
 
-- **Canvas（用户 fork）**：以 patch 形式内嵌进 fork 构建，随 fork 既有补丁一同 rebase，升级维护成本最低。
-- **Paper/Folia 上游**：提供源代码与构建嵌入教程，供维护者自行 patch。
+- **Canvas（用户 fork）**：以 weaver feature patch 内嵌进 fork 构建，随 fork 既有补丁一同 rebase，升级维护成本最低。**已合入**。
+- **Paper/Folia 上游**：提供源代码与构建嵌入教程（`BUILD_GUIDE.md`），供维护者自行 patch；Canvas 无 Mixin 运行时，故不走 Mixin 形态。
 - **模组端**：远期目标，复用同一 vanilla IO 适配层。
 
 ## 状态含义

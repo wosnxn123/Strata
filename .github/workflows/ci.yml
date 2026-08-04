@@ -63,6 +63,9 @@ jobs:
         if: hashFiles('Cargo.toml') != ''
         run: cargo build --release --workspace
 
+      - name: Check strata-ffi with JNI feature
+        run: cargo clippy -p strata-ffi --features jni --all-targets -- -D warnings
+
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
@@ -97,7 +100,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build native library
-        run: cargo build --release -p strata-ffi
+        run: cargo build --release -p strata-ffi --features jni
 
       - name: Stage native library into bridge resources
         run: cp target/release/libstrata_ffi.so java-bridge/src/main/resources/natives/strata_ffi.so

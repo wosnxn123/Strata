@@ -58,9 +58,9 @@ exact tree verified to compile.
   null)` which clears the now-stale Anvil record (no-op if the region file
   doesn't exist); on any failure falls through to the original Anvil write —
   data is never lost.
-- **Lifecycle**: store opened in the ServerLevel constructor (overworld only),
-  flushed on every `saveAllChunks(flush=true)`, closed in `stopPart2()` before
-  the level lock is released.
+- **Lifecycle**: store opened in the ServerLevel constructor (every level:
+  overworld/nether/end and plugin-created worlds), flushed on every
+  `saveAllChunks(flush=true)`, closed in `stopPart2()` before the level lock is released.
 - **Native bridge**: vendored `dev.strata.bridge.StrataNative`; at runtime it
   extracts `/natives/strata_ffi.{so,dll,dylib}` from the classpath into a temp
   dir and `System.load`s it. Missing/broken native => one warning, permanent
@@ -117,10 +117,10 @@ applyAllPatches:             BUILD SUCCESSFUL in 24s (APPLY_RC=0)
   -> /root/canvas/canvas-server/build/libs/canvas-paperclip-26.2.local-SNAPSHOT.jar (62,947,874 bytes)
 ```
 
-Fork commit `3812aae4c4d51883e72200079ed4651ecd590a07` on CNB /root/canvas main
-(10 files: 2 patches + GlobalConfiguration + 7 sources). Push to GitHub
-**blocked** (no usable GitHub credentials on CNB); shipped here as
-`fork-commit-multiworld.patch` (apply with `git am`).
+Fork commit `3812aae4c4d51883e72200079ed4651ecd590a07` (10 files: 2 patches +
+GlobalConfiguration + 7 sources) — **merged into [wosnxn123/Canvas](https://github.com/wosnxn123/Canvas)
+`main` and pushed** (applied locally via `git am`, commit `b44177c5`).
+`fork-commit-multiworld.patch` kept here as the reproducible artifact.
 
 Round 2 history: 9-param `open` (compressionThreads) rework, patches
 byte-identical. Round 1: 1 compile error fixed (multi-catch subclassing,
@@ -135,7 +135,7 @@ byte-identical. Round 1: 1 compile error fixed (multi-catch subclassing,
 - A chunk deleted while Strata is active writes an empty-payload marker to the
   vstore and clears the Anvil copy; if Strata is later disabled without
   converting back, that chunk appears gone to Anvil-only readers.
-- strata-cli itself still converts overworld only; the server-side converter
-  here walks all dimensions of the world root.
+- strata-cli walks all dimensions too (overworld root, `DIM-1`/`DIM1`,
+  `dimensions/minecraft/*`), matching the server-side converter.
 - Mojang manifest downloads from CNB needed a hosts pin (`piston-meta.mojang.com`);
   unrelated to the patch itself.

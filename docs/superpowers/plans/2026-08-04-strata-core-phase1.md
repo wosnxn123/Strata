@@ -1,5 +1,7 @@
 # Strata Core (Phase 1) Implementation Plan — v2
 
+> ✅ **状态：已全部完成**（2026-08-04）。17 个任务全部落地并验证：70+ 测试全绿、clippy -D warnings 零告警、CI 双平台（Windows + Linux）全绿、基准见 `benches/RESULTS.md`（体积 0.097×、读 p99 11µs）。后续 Phase 2（FFI/JNI/Canvas 集成）与多世界/多维度扩展见设计规格 §11 与提交历史；文中 `- [ ]` 复选框为执行时原样保留，不代表未完成。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 实现 Strata 存储引擎纯 Rust 核心（`strata-core`）与离线工具（`strata-cli`）：40B 信封、段日志引擎、三层有界索引（位图+SIEVE+磁盘索引页）、epoch 崩溃恢复、影子双副本 manifest、三档 GC（hole-punch/删除/压实打分）、分块冷归档（superfeatures 排序 + per-type 字典）、Cesium 式双向转换（覆盖、保留源、进度恢复）、`strata.properties` 配置矩阵——全部独立于 JVM，可测试、可基准，**内存与世界大小无关**。

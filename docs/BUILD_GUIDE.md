@@ -24,8 +24,10 @@ Windows 构建 native 库需要 MSVC 工具链（`x86_64-pc-windows-msvc` 默认
 在仓库根目录：
 
 ```bash
-cargo build --release -p strata-ffi
+cargo build --release -p strata-ffi --features jni
 ```
+
+> ⚠️ **必须带 `--features jni`**：不带该 feature 的产物只有 C ABI（`strata_*`），不导出 `Java_dev_strata_bridge_StrataNative_*` JNI 符号，Java 侧 `load()` 后调用 native 方法会 `UnsatisfiedLinkError` 并回退 Anvil。
 
 产物位置与文件名（**注意各平台 cargo 输出名不同**）：
 
@@ -40,15 +42,20 @@ cargo build --release -p strata-ffi
 ```bash
 # Linux x86_64（target 通常即本机）
 rustup target add x86_64-unknown-linux-gnu
-cargo build --release --target x86_64-unknown-linux-gnu -p strata-ffi
+cargo build --release --features jni --target x86_64-unknown-linux-gnu -p strata-ffi
 
-# Windows x86_64
+# Windows x86_64（Windows 本机构建，MSVC）
 rustup target add x86_64-pc-windows-msvc
-cargo build --release --target x86_64-pc-windows-msvc -p strata-ffi
+cargo build --release --features jni --target x86_64-pc-windows-msvc -p strata-ffi
+
+# Windows x86_64（Linux 交叉编译，已验证路线：CNB/CI 上用）
+sudo apt-get install -y gcc-mingw-w64-x86-64
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --features jni --target x86_64-pc-windows-gnu -p strata-ffi
 
 # macOS Apple Silicon
 rustup target add aarch64-apple-darwin
-cargo build --release --target aarch64-apple-darwin -p strata-ffi
+cargo build --release --features jni --target aarch64-apple-darwin -p strata-ffi
 ```
 
 交叉产物在 `target/<target>/release/` 下，文件名同上表。
@@ -95,10 +102,11 @@ gradle jar
 1. 把 `java-bridge.jar` 加入 server classpath。paperweight/Gradle 构建里任选其一：
    - buildscript 依赖：`additionalRuntimeClasspath("dev.strata:java-bridge:0.1.0")`（或把 jar 放进 `libs/` 后 `runtimeOnly(fileTree("libs"))`）；
    - 或直接把 jar 放进服务器运行目录的 `libraries/` 目录（Paper 启动器会扫描 `libraries/` 下按 maven 布局组织的 jar）。
-2. 在 fork 的源码 patch 中直接调用 `dev.strata.bridge.StrataNative`：
-   - 启动期（world 加载前）调用一次 `StrataNative.load()`，然后按维度 `StrataNative.open(worldDir + "/vstore", ...)` 拿 handle；
-   - 在 Moonrise chunk IO 的字节边界 hook 点把 NBT blob 交给 `StrataNative.write(handle, x, z, typeId, nbt)`，读取路径改走 `StrataNative.read(...)`（返回 `null` 即记录不存在，回退默认生成逻辑）；
-   - 定期/关服时 `flush` / `gc` / `tier` / `close`。
+2. 在 fork 的源码 patch 中直接调用 `dev.strata.bridge.StrataNative`（参考 `canvas-patch/` 下的成品集成）：
+   - 每个 ServerLevel 构造期解析**自己的**世界根与维度目录（`LevelStorageAccess.getLevelPath(ROOT)` / `getDimensionPath(dimension)`），对维度目录调一次 `StrataNative.open(dimDir + "/vstore", ..., compressionThreads)` 拿 handle——主世界/下界/末地/插件创建的世界各自独立 store；
+   - 在 Moonrise chunk IO 的字节边界 hook 点（`ChunkDataController`/`EntityDataController`/`PoiDataController` 的 `startWrite`/`readData`）把 NBT blob 交给 `StrataNative.write(handle, x, z, typeId, nbt)`；写成功返回 DELETE 结果清除旧 Anvil 副本，读取 `null`（无记录）回退 Anvil 读；
+   - 定期/关服时对全部打开的 store `flush` / `gc` / `tier` / `close`；
+   - `open` 第 9 参 `compressionThreads`：批量压缩线程数（0=自动全核 / 1=串行默认，TPS 优先 / N≥2 限流），读世界根 `strata.properties` 的 `strata.compression.threads`。
 3. Canvas 的集成 patch 由 Strata 项目维护（见 `docs/SERVER_SUPPORT.md`），随 fork 既有补丁同一 rebase 流程维护。
 
 ### 5.2 Paper 上游（自行 patch）
@@ -107,11 +115,14 @@ classpath 接入方式与 5.1 相同（`additionalRuntimeClasspath` 或 `librari
 
 | 目标类（net.minecraft 服务端，按 Paper/Folia 源码布局） | 要 hook 的方法 |
 | --- | --- |
-| `ChunkDataController`（chunk 数据，type_id = 0） | `startWrite` / `finishWrite` / `readData` / `finishRead` |
-| `EntityDataController`（entity 数据，type_id = 1） | 同上 |
+| `ChunkDataController`（chunk 数据，type_id = 0） | `startWrite` / `readData` |
+| `EntityDataController`（entity 数据，type_id = 1） | 同上（构造器补 `ServerLevel` 引用） |
 | `PoiDataController`（poi 数据，type_id = 2） | 同上 |
+| `ServerLevel` | 构造器尾部：per-level 解析世界根/维度目录并 `openFor`（字段 + accessor） |
+| `MinecraftServer` | `saveAllChunks` 后 flush 全部 store；关服路径 `closeAll` |
+| `net.minecraft.server.Main` / `org.bukkit.craftbukkit.Main` | 启动转换参数（`--strataConvertToStrata` / `--strataConvertToAnvil`） |
 
-接入语义：写路径在 `startWrite`/`finishWrite` 处拦截序列化后的 NBT 字节交给 `StrataNative.write`；读路径在 `readData`/`finishRead` 处改为 `StrataNative.read`，`null` 时走原版"无记录"分支。shim 挂在 Moonrise chunk IO 线程之下（regionizer 下游），不触碰 tick 线程模型——详见设计文档 §11（`docs/superpowers/specs/2026-08-04-strata-storage-design.md`）。
+接入语义（已在 Canvas 验证）：写路径在 `startWrite` 拦截序列化后的 NBT 字节交给 `StrataNative.write`，成功则返回 `WriteResult.DELETE`（清除旧 Anvil 副本，region 文件不存在时无操作）；读路径在 `readData` 先查 vstore——命中返回 `SYNC_READ`、已删除返回 `NO_DATA`、未命中**落回 Anvil 原路径**（混存迁移期关键）。shim 挂在 Moonrise chunk IO 线程之下（regionizer 下游），不触碰 tick 线程模型——详见设计文档 §11（`docs/superpowers/specs/2026-08-04-strata-storage-design.md`）。完整可参考实现：本仓 `canvas-patch/` 目录（weaver patch + Java 源码，随 Canvas fork 实服验证过）。
 
 ### 5.3 模组端（Fabric / NeoForge）
 

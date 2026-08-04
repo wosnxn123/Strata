@@ -1,6 +1,6 @@
 # Strata
 
-[![CI](https://github.com/wosnxn123/strata/actions/workflows/ci.yml/badge.svg)](https://github.com/wosnxn123/strata/actions/workflows/ci.yml)
+[![CI](https://github.com/wosnxn123/Strata/actions/workflows/ci.yml/badge.svg)](https://github.com/wosnxn123/Strata/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org/)
 
@@ -18,10 +18,10 @@
 
 ### 1. 获取带 Strata 的服务端 / Get a Strata-enabled server
 
-- **Canvas（主集成目标 / primary target）**：使用 [wosnxn123/Canvas](https://github.com/wosnxn123/Canvas) 构建的 paperclip jar（Strata 补丁已内置）。构建方式见该仓库与 [BUILD_GUIDE.md](BUILD_GUIDE.md)。
-  Use the paperclip jar built from [wosnxn123/Canvas](https://github.com/wosnxn123/Canvas) (Strata patches included). See that repo and [BUILD_GUIDE.md](BUILD_GUIDE.md).
-- **其它 Paper/Folia 系服务端 / other Paper/Folia forks**：按 [docs/SERVER_SUPPORT.md](docs/SERVER_SUPPORT.md) 与 [BUILD_GUIDE.md](BUILD_GUIDE.md) 将源码补丁嵌入你的 fork 后自行构建。
-  Embed the source patches into your own fork following [docs/SERVER_SUPPORT.md](docs/SERVER_SUPPORT.md) and [BUILD_GUIDE.md](BUILD_GUIDE.md).
+- **Canvas（主集成目标 / primary target）**：使用 [wosnxn123/Canvas](https://github.com/wosnxn123/Canvas) 构建的 paperclip jar（Strata 补丁已内置）。构建方式见该仓库与 [BUILD_GUIDE.md](docs/BUILD_GUIDE.md)。
+  Use the paperclip jar built from [wosnxn123/Canvas](https://github.com/wosnxn123/Canvas) (Strata patches included). See that repo and [BUILD_GUIDE.md](docs/BUILD_GUIDE.md).
+- **其它 Paper/Folia 系服务端 / other Paper/Folia forks**：按 [docs/SERVER_SUPPORT.md](docs/SERVER_SUPPORT.md) 与 [BUILD_GUIDE.md](docs/BUILD_GUIDE.md) 将源码补丁嵌入你的 fork 后自行构建。
+  Embed the source patches into your own fork following [docs/SERVER_SUPPORT.md](docs/SERVER_SUPPORT.md) and [BUILD_GUIDE.md](docs/BUILD_GUIDE.md).
 
 构建产物 paperclip 中已内嵌对应平台的 native 库（`strata_ffi.dll` / `libstrata_ffi.so`）。若 native 缺失或加载失败，服务器**自动回退 Anvil**，不会崩溃。
 The paperclip artifact embeds the platform native library (`strata_ffi.dll` / `libstrata_ffi.so`). If the native is missing or fails to load, the server **falls back to Anvil automatically** — it never crashes.
@@ -183,7 +183,7 @@ strata.gc.budget-bytes=33554432
 - [设计规格 / Design spec：Strata 混合双层存储引擎](docs/superpowers/specs/2026-08-04-strata-storage-design.md)
 - [实施计划 / Implementation plan：strata-core Phase 1](docs/superpowers/plans/2026-08-04-strata-core-phase1.md)
 - [服务端支持状态 / Server support matrix](docs/SERVER_SUPPORT.md)
-- [构建指南 / Build guide（自构建嵌入教程）](BUILD_GUIDE.md)
+- [构建指南 / Build guide（自构建嵌入教程）](docs/BUILD_GUIDE.md)
 - [基准结果 / Benchmark results](benches/RESULTS.md)
 
 ---
