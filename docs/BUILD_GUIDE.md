@@ -48,7 +48,7 @@ cargo build --release --features jni --target x86_64-unknown-linux-gnu -p strata
 rustup target add x86_64-pc-windows-msvc
 cargo build --release --features jni --target x86_64-pc-windows-msvc -p strata-ffi
 
-# Windows x86_64（Linux 交叉编译，已验证路线：CNB/CI 上用）
+# Windows x86_64（Linux 交叉编译，已验证路线：CNB 上用；CI 则在 windows-latest 原生 MSVC 构建）
 sudo apt-get install -y gcc-mingw-w64-x86-64
 rustup target add x86_64-pc-windows-gnu
 cargo build --release --features jni --target x86_64-pc-windows-gnu -p strata-ffi
@@ -60,7 +60,7 @@ cargo build --release --features jni --target aarch64-apple-darwin -p strata-ffi
 
 交叉产物在 `target/<target>/release/` 下，文件名同上表。
 
-> CI 参考实现：`.github/workflows/ci.yml` 的 `java-bridge` job 在 ubuntu-latest 上执行 `cargo build --release -p strata-ffi` 并把 `libstrata_ffi.so` 复制进桥 jar 后上传 artifact，可直接下载复用，跳过本地编译。
+> CI 参考实现：`.github/workflows/ci.yml` 的 `build` job 在 windows-latest 与 ubuntu-latest 上各自原生构建全部产物并上传 artifact——`strata-cli-<os>`（CLI 可执行）、`strata-native-<os>`（`strata_ffi.dll` / `libstrata_ffi.so`，带 JNI feature）、`strata-natives-<os>`（按 `natives/<file>` 打包、可直接注入 paperclip 的 natives jar）；`java-bridge-<os>` job 再把对应平台 native 复制进桥 jar 上传。均可直接下载复用，跳过本地编译。
 
 ---
 

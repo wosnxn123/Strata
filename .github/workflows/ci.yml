@@ -34,21 +34,32 @@ jobs:
         if: hashFiles('Cargo.toml') != ''
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Clippy (JNI feature)
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo clippy -p strata-ffi --features jni --all-targets -- -D warnings
+
       - name: Test
         if: hashFiles('Cargo.toml') != ''
         run: cargo test --workspace
 
-  release:
-    name: Release (${{ matrix.os }})
+  build:
+    name: Build (${{ matrix.os }})
     needs: test
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            cli_bin: strata-cli.exe
+            native: strata_ffi.dll
+            native_res: strata_ffi.dll
+          - os: ubuntu-latest
+            cli_bin: strata-cli
+            native: libstrata_ffi.so
+            native_res: strata_ffi.so
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -59,27 +70,63 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Build workspace (release)
         if: hashFiles('Cargo.toml') != ''
         run: cargo build --release --workspace
 
-      - name: Check strata-ffi with JNI feature
-        run: cargo clippy -p strata-ffi --features jni --all-targets -- -D warnings
+      - name: Build strata-ffi with JNI feature
+        run: cargo build --release -p strata-ffi --features jni
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
           name: strata-cli-${{ matrix.os }}
-          path: target/release/strata-cli*
-          if-no-files-found: ignore
+          path: target/release/${{ matrix.cli_bin }}
+          if-no-files-found: error
 
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-native-${{ matrix.os }}
+          path: target/release/${{ matrix.native }}
+          if-no-files-found: error
+
+      - name: Package natives jar (paperclip injection ready)
+        shell: bash
+        run: |
+          mkdir -p staging/natives
+          cp "target/release/${{ matrix.native }}" "staging/natives/${{ matrix.native_res }}"
+          jar cf strata-natives.jar -C staging natives
+
+      - name: Upload natives jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-natives-${{ matrix.os }}
+          path: strata-natives.jar
+          if-no-files-found: error
 
   java-bridge:
-    name: Java Bridge
+    name: Java Bridge (${{ matrix.os }})
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            native_src: target/release/strata_ffi.dll
+            native_res: strata_ffi.dll
+          - os: ubuntu-latest
+            native_src: target/release/libstrata_ffi.so
+            native_res: strata_ffi.so
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -99,11 +146,14 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build native library
+      - name: Build native library (JNI feature)
         run: cargo build --release -p strata-ffi --features jni
 
       - name: Stage native library into bridge resources
-        run: cp target/release/libstrata_ffi.so java-bridge/src/main/resources/natives/strata_ffi.so
+        shell: bash
+        run: |
+          mkdir -p java-bridge/src/main/resources/natives
+          cp "${{ matrix.native_src }}" "java-bridge/src/main/resources/natives/${{ matrix.native_res }}"
 
       - name: Build bridge jar
         working-directory: java-bridge
@@ -112,5 +162,6 @@ jobs:
       - name: Upload bridge jar
         uses: actions/upload-artifact@v4
         with:
-          name: java-bridge
+          name: java-bridge-${{ matrix.os }}
           path: java-bridge/build/libs/java-bridge.jar
+          if-no-files-found: error
