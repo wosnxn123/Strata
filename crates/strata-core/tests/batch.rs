@@ -78,9 +78,10 @@ fn batch_write_preserves_all() {
 
 #[test]
 fn batch_parallel_faster_than_serial() {
-    // 注意：该断言在多核机器（CI 32 核）上依赖并行压缩的显著收益；批量
-    // 路径以 compression_threads=0 显式 opt-in 全核并行（默认串行为主），
-    // 核数很少时并行收益可能退化，故用 `<=`（允许平局）而非严格 2x。
+    // 批量路径以 compression_threads=0 显式 opt-in 全核并行（默认串行为主）。
+    // 正确性（逐条读回）与核数无关，恒验证；速度断言仅在 ≥4 核机器上有
+    // 意义——GitHub 标准 runner 只有 2 vCPU，线程调度开销会吃掉并行收益，
+    // 故核数不足时跳过速度断言（32 核基准机仍会断言，见 benches/RESULTS.md）。
     let make_items = || -> Vec<BatchItem> {
         let mut rng = Lcg(0x5EED_5EED_5EED_5EED);
         (0..2000)
@@ -128,9 +129,25 @@ fn batch_parallel_faster_than_serial() {
         batch,
         serial.as_secs_f64() / batch.as_secs_f64().max(f64::EPSILON)
     );
+
+    // 正确性抽查（与核数无关）：批量写入的数据可逐条读回。
+    {
+        let s = Store::open(dir_batch.path(), StoreConfig::default()).unwrap();
+        for it in items_batch.iter().step_by(500) {
+            assert_eq!(s.read(it.x, it.z, it.type_id).unwrap().unwrap(), it.nbt);
+        }
+    }
+
+    // 速度断言仅在核数足够时有意义：核太少时（如 GitHub windows-latest
+    // 2 vCPU），线程调度开销可吃掉并行收益。
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if cores < 4 {
+        eprintln!("batch_parallel: only {cores} core(s), skipping speed assertion");
+        return;
+    }
     assert!(
         batch <= serial,
-        "batch {batch:?} slower than serial {serial:?}"
+        "batch {batch:?} slower than serial {serial:?} on {cores} cores"
     );
 }
 
