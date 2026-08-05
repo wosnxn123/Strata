@@ -464,15 +464,8 @@ fn throw_strata_exception(env: JniEnv, msg: &str) {
         else {
             return;
         };
-        // SAFETY: 类名为 NUL 结尾的字节串字面量。
-        let cls = unsafe {
-            find_class(
-                env,
-                b"dev/strata/bridge/StrataException\0"
-                    .as_ptr()
-                    .cast::<c_char>(),
-            )
-        };
+        // SAFETY: 类名为 C 字符串字面量（NUL 结尾由 c"" 保证）。
+        let cls = unsafe { find_class(env, c"dev/strata/bridge/StrataException".as_ptr()) };
         if cls.is_null() {
             // 类未加载：NoClassDefFoundError 已挂起，放弃抛异常。
             return;
