@@ -159,6 +159,12 @@ jobs:
         working-directory: java-bridge
         run: gradle jar
 
+      - name: Normalize bridge jar name
+        shell: bash
+        run: |
+          src=$(ls java-bridge/build/libs/java-bridge-*.jar | grep -v -- '-sources' | head -1)
+          cp "$src" java-bridge/build/libs/java-bridge.jar
+
       - name: Upload bridge jar
         uses: actions/upload-artifact@v4
         with:
